@@ -1,0 +1,25 @@
+# Audio
+torch>=2.0
+torchaudio>=2.0
+transformers>=4.30
+huggingface-hub>=0.16
+sounddevice>=0.4.6
+soundfile>=0.12
+
+# Visual
+mediapipe>=0.10
+opencv-python>=4.8
+
+# G2P
+g2p-en>=2.1
+
+# ML / Math
+numpy>=1.24
+scipy>=1.10
+scikit-learn>=1.3
+
+# CLI
+rich>=13.0
+
+# Utilities
+joblib>=1.3
