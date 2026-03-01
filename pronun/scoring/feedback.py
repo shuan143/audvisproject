@@ -1,4 +1,4 @@
-"""Human-readable pronunciation tips per phoneme."""
+"""Human-readable pronunciation tips per phoneme and viseme."""
 
 # Per-phoneme improvement advice
 PHONEME_TIPS = {
@@ -30,6 +30,39 @@ PHONEME_TIPS = {
     "oʊ": "Start with 'oh', glide to a slight 'oo'. Keep lips rounded.",
     "eɪ": "Start with 'eh', glide to 'ee'. As in 'say'.",
     "ɔɪ": "Start with 'aw', glide to 'ee'. As in 'boy'.",
+}
+
+# Per-viseme mouth-shape tips (Lee 13-viseme map)
+VISEME_TIPS = {
+    0:  None,   # SIL — silence, skip
+    1:  "Press both lips firmly together, then release (P, B, M sounds).",
+    2:  "Touch tongue tip to the ridge just behind upper teeth; let lips part slightly (T, D, S, Z, TH, DH).",
+    3:  "Raise the back of your tongue toward the soft palate; lips stay neutral (K, G, N, L, Y, H sounds).",
+    4:  "Bring teeth close together and round lips slightly; tongue pulls back (CH, J, SH, ZH sounds).",
+    5:  "Rest upper front teeth lightly on lower lip; let air stream through (F, V sounds).",
+    6:  "Round and slightly protrude both lips; drop jaw a little (R, W sounds).",
+    7:  "Spread lips wide as in a smile; keep tongue high and forward (EE, IH sounds).",
+    8:  "Open mouth moderately and spread lips; tongue at mid height (AY, EH, AE sounds).",
+    9:  "Drop jaw wide open; relax lips; tongue rests low (AH, OW, AW sounds).",
+    10: "Round lips into a forward 'O'; jaw moderately open (AW, OY, OH sounds).",
+    11: "Round lips into a tight circle; jaw nearly closed; tongue high and back (UH, OO sounds).",
+    12: "Lips slightly parted and relaxed; curl tongue tip back slightly (ER sound).",
+}
+
+VISEME_PHONEME_EXAMPLES = {
+    0:  "",
+    1:  "P, B, M",
+    2:  "T, D, S, Z, TH, DH",
+    3:  "K, G, N, L, Y, H",
+    4:  "CH, J, SH, ZH",
+    5:  "F, V",
+    6:  "R, W",
+    7:  "EE, IH",
+    8:  "AY, EH, AE",
+    9:  "AH, OW, AW",
+    10: "AW, OY, OH",
+    11: "UH, OO",
+    12: "ER",
 }
 
 # Score thresholds for feedback levels
@@ -107,6 +140,39 @@ def generate_word_feedback(word_scores: list[dict]) -> list[dict]:
             "level": level,
         })
     return feedback
+
+
+def get_viseme_tip(viseme_id: int) -> str | None:
+    """Get mouth-shape tip for a Lee viseme ID."""
+    return VISEME_TIPS.get(viseme_id)
+
+
+def generate_visual_feedback(
+    viseme_sequence: list[int], visual_score: float | None
+) -> list[dict]:
+    """Generate per-viseme mouth-shape advice.
+
+    Returns a list of unique visemes (excluding SIL) with tips.
+    Empty list if camera was disabled (visual_score is None).
+    """
+    if not viseme_sequence or visual_score is None:
+        return []
+
+    from pronun.data.lee_map import LEE_VISEME_LABELS
+
+    seen: set[int] = set()
+    result = []
+    for vid in viseme_sequence:
+        if vid == 0 or vid in seen:   # skip silence and duplicates
+            continue
+        seen.add(vid)
+        result.append({
+            "viseme_id": vid,
+            "viseme_label": LEE_VISEME_LABELS.get(vid, str(vid)),
+            "phoneme_examples": VISEME_PHONEME_EXAMPLES.get(vid, ""),
+            "tip": get_viseme_tip(vid),
+        })
+    return result
 
 
 def overall_feedback(score: float, word_scores: list[dict] = None) -> str:

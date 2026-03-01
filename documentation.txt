@@ -1,0 +1,996 @@
+================================================================================
+         PRONUN — PRONUNCIATION CORRECTION SYSTEM
+         Complete Technical Documentation
+================================================================================
+
+VERSION:  March 2026
+LOCATION: audvisproject/pronun/
+LANGUAGE: Python 3.10+
+
+
+────────────────────────────────────────────────────────────────────────────────
+TABLE OF CONTENTS
+────────────────────────────────────────────────────────────────────────────────
+
+  1. Introduction
+  2. System Architecture
+  3. Module Reference
+  4. Pipeline Stage 1 — Grapheme-to-Phoneme (G2P)
+  5. Pipeline Stage 2 — Audio Scoring (wav2vec2 + GOP)
+  6. Pipeline Stage 3 — Visual Feature Extraction
+  7. Pipeline Stage 4 — Visual Scoring (Gaussian HMM)
+  8. Pipeline Stage 5 — Score Combination
+  9. Feedback and Session Tracking
+  10. CLI Reference
+  11. Configuration Constants
+  12. Known Limitations
+  13. References and Citations
+
+
+────────────────────────────────────────────────────────────────────────────────
+1. INTRODUCTION
+────────────────────────────────────────────────────────────────────────────────
+
+Pronun is a command-line pronunciation correction tool that evaluates spoken
+English at the phoneme level. It combines two independent scoring modalities:
+
+  AUDIO  — wav2vec2 CTC (Connectionist Temporal Classification) phoneme
+            recognition followed by GOP (Goodness of Pronunciation) scoring.
+
+  VISUAL — 3D lip-landmark extraction via MediaPipe FaceLandmarker, followed
+            by Gaussian HMM (Hidden Markov Model) scoring against the expected
+            viseme sequence derived from the Lee ARPAbet-to-viseme map.
+
+Both scores are adaptively fused per-phoneme, giving higher weight to visual
+evidence for phonemes that are visually distinctive (bilabial, labiodental).
+
+The tool is designed particularly for Mandarin-speaking learners of English,
+with phoneme focus sets targeting common contrasts (r/l, th, v/w, b/p, vowels).
+
+
+────────────────────────────────────────────────────────────────────────────────
+2. SYSTEM ARCHITECTURE
+────────────────────────────────────────────────────────────────────────────────
+
+2.1 High-Level Data Flow
+─────────────────────────
+
+  Spoken utterance
+       │
+       ├── [microphone] ──► SyncRecorder ──► audio waveform (16 kHz, mono)
+       │
+       └── [webcam]     ──► SyncRecorder ──► video frames  (RGB, 30 fps)
+                                                    │
+                                                    ▼
+                         ┌──────────────────────────────────────────────┐
+                         │              AUDIO PIPELINE                  │
+                         │   text ──► G2P ──► IPA target sequence      │
+                         │   audio ──► wav2vec2 ──► log_probs [T×V]    │
+                         │   align ──► GOP ──► per-phoneme scores      │
+                         └─────────────────────┬────────────────────────┘
+                                               │ audio_score
+                                               │
+                         ┌─────────────────────▼────────────────────────┐
+                         │             VISUAL PIPELINE                   │
+                         │   frames ──► MediaPipe ──► 40 landmarks×3D   │
+                         │   normalize ──► feature vectors [T×248]      │
+                         │   text ──► Lee map ──► viseme sequence       │
+                         │   HMM Forward Algorithm ──► visual_score     │
+                         └─────────────────────┬────────────────────────┘
+                                               │ visual_score
+                                               │
+                         ┌─────────────────────▼────────────────────────┐
+                         │            ADAPTIVE COMBINATION               │
+                         │   per-phoneme: w_a × audio + w_v × visual   │
+                         │   ──► combined_score per phoneme             │
+                         │   ──► word_score = mean(phonemes in word)    │
+                         │   ──► sentence_score = mean(word_scores)     │
+                         └──────────────────────────────────────────────┘
+
+2.2 Package Structure
+──────────────────────
+
+  pronun/
+  ├── cli.py               CLI entry point (argparse + rich display)
+  ├── config.py            All numeric constants
+  ├── audio/
+  │   ├── g2p.py           Grapheme-to-Phoneme conversion
+  │   ├── phoneme_recognizer.py   wav2vec2 inference
+  │   └── gop_scorer.py    GOP scoring and edit-distance alignment
+  ├── visual/
+  │   ├── features/
+  │   │   ├── landmark_extractor.py   MediaPipe landmark extraction
+  │   │   ├── normalizer.py           Centering + scale normalization
+  │   │   └── feature_builder.py      248-dim feature vector construction
+  │   ├── scoring/
+  │   │   ├── hmm.py              Left-to-right Gaussian HMM
+  │   │   ├── visual_scorer.py    Forward Algorithm → 0-100 score
+  │   │   └── reference.py        Native-speaker reference baseline
+  │   └── viseme/
+  │       ├── lee_viseme.py        Lee ARPAbet→viseme map (Mode B)
+  │       └── kmeans_viseme.py     K-means viseme clustering (Mode A)
+  ├── scoring/
+  │   ├── combiner.py      Adaptive audio/visual weight fusion
+  │   └── feedback.py      Per-phoneme tips and level assignment
+  ├── workflow/
+  │   ├── session.py       Orchestrates the full practice pipeline
+  │   ├── recorder_sync.py Simultaneous A/V capture
+  │   ├── camera.py        Webcam management
+  │   └── tracker.py       In-memory session history
+  └── data/
+      ├── sentence_lists.py   Practice sentences (beginner/intermediate/advanced)
+      ├── word_lists.py       Practice words + phoneme focus sets
+      └── lee_map.py          ARPAbet→viseme ID lookup table
+
+
+────────────────────────────────────────────────────────────────────────────────
+3. MODULE REFERENCE
+────────────────────────────────────────────────────────────────────────────────
+
+3.1 workflow/session.py — Session
+───────────────────────────────────
+The main orchestrator. Used as a context manager:
+
+    with Session(use_camera=True, mode="B") as session:
+        result = session.practice_sentence("How are you today")
+
+  __init__(use_camera, mode, kmeans_model)
+    use_camera   bool   Enable webcam (default True)
+    mode         str    "A", "B", or "both" (default "B")
+    kmeans_model        Pre-trained KMeansViseme for Mode A (optional)
+
+  practice_word(word) -> dict
+    Keys: word, target_phonemes, audio_score, visual_score_a, visual_score_b,
+          visual_score, visual_details_a, visual_details_b, combined_score,
+          phoneme_details, feedback, overall_feedback, visual_feedback
+
+  practice_sentence(sentence) -> dict
+    Keys: sentence, sentence_score, audio_score, visual_score_a, visual_score_b,
+          visual_score, visual_details_a, visual_details_b, combined_score,
+          word_scores, word_segments, phoneme_details, feedback,
+          overall_feedback, visual_feedback
+
+  get_progress(sentence=None) -> dict
+    Keys: history, trend, summary
+
+3.2 workflow/recorder_sync.py — SyncRecorder
+──────────────────────────────────────────────
+Captures audio and video simultaneously.
+
+  record(audio_path) -> (audio_array, video_frames)
+    Recording stops after SILENCE_DURATION seconds of silence, or after
+    MAX_RECORD_SECONDS. Uses sounddevice for audio, OpenCV for video.
+
+3.3 workflow/tracker.py — SessionTracker
+─────────────────────────────────────────
+In-memory history of practice attempts within one session.
+
+  record(result)         Append a result dict to history
+  get_history(sentence)  Return all attempts for a sentence (or all)
+  get_trend(sentence)    Return score trend list
+  summary()              Dict: total_attempts, avg_score, best_score,
+                               improvement (last − first)
+
+
+────────────────────────────────────────────────────────────────────────────────
+4. PIPELINE STAGE 1 — GRAPHEME-TO-PHONEME (G2P)
+────────────────────────────────────────────────────────────────────────────────
+
+4.1 Library
+────────────
+Module:  pronun/audio/g2p.py
+Library: g2p-en [Park & Mulc, 2019], backed by the CMU Pronouncing Dictionary
+         and NLTK averaged_perceptron_tagger_eng for part-of-speech-aware
+         pronunciation.
+
+4.2 ARPAbet Output
+───────────────────
+g2p-en converts English text to ARPAbet phonemes with stress digits
+(e.g., AH1, AH0). Pronun strips stress digits to get canonical phonemes:
+
+    "hello" ──► ["HH", "AH", "L", "OW"]
+
+4.3 IPA Conversion for wav2vec2
+─────────────────────────────────
+Because wav2vec2-lv-60-espeak-cv-ft uses IPA symbols in its vocabulary,
+ARPAbet phonemes are mapped to IPA via a lookup table (ARPABET_TO_IPA):
+
+    "HH" → "h"    "AH" → "ʌ"    "L" → "l"    "OW" → "oʊ"
+
+Full table (40 ARPAbet → IPA mappings):
+
+  Consonants:
+    P→p    B→b    T→t    D→d    K→k    G→ɡ
+    CH→tʃ  JH→dʒ  F→f    V→v    TH→θ   DH→ð
+    S→s    Z→z    SH→ʃ   ZH→ʒ   HH→h   M→m
+    N→n    NG→ŋ   L→l    R→ɹ    Y→j    W→w
+  Vowels:
+    IY→iː  IH→ɪ   EY→eɪ  EH→ɛ   AE→æ
+    AA→ɑː  AO→ɔː  AH→ʌ   UH→ʊ   UW→uː
+    ER→ɝ   AX→ə
+  Diphthongs:
+    AY→aɪ  AW→aʊ  OY→ɔɪ  OW→oʊ
+
+4.4 Word Segmentation
+──────────────────────
+For sentence scoring, text_to_ipa_by_word() processes each word separately
+and records phoneme boundary indices:
+
+    word_segments = [
+        {"word": "hello", "start": 0, "end": 4},
+        {"word": "world", "start": 4, "end": 7},
+    ]
+
+These boundaries are later used to map phoneme scores back to words.
+
+4.5 Viseme Conversion (for Visual Pipeline)
+─────────────────────────────────────────────
+text_to_visemes() converts ARPAbet output to viseme IDs using the Lee map
+(see Section 7.1 for the full table).
+
+
+────────────────────────────────────────────────────────────────────────────────
+5. PIPELINE STAGE 2 — AUDIO SCORING (wav2vec2 + GOP)
+────────────────────────────────────────────────────────────────────────────────
+
+5.1 Model
+──────────
+Module: pronun/audio/phoneme_recognizer.py
+Model:  facebook/wav2vec2-lv-60-espeak-cv-ft  [Baevski et al., 2020]
+
+A transformer-based model pre-trained with contrastive learning on 60k hours
+of unlabeled speech (LibriVox), then fine-tuned for IPA phoneme recognition
+using CTC loss on Common Voice [Grosman, 2021].
+
+Input:  raw audio waveform at 16 000 Hz
+Output: logits matrix of shape [T, V]
+        T = number of time frames (~50 frames/second)
+        V = vocabulary size (IPA phoneme set + CTC blank token)
+
+If the input audio is not at 16 kHz, it is resampled via torchaudio.
+
+5.2 CTC Decoding [Graves et al., 2006]
+────────────────────────────────────────
+After the transformer, a softmax layer produces per-frame posterior
+probabilities. Log-softmax is applied to get log probabilities:
+
+    log_probs[t, p] = log P(phoneme p | frame t, audio)
+
+Greedy CTC decoding: argmax over vocabulary for each frame, then collapse
+consecutive duplicates and remove blank tokens (<pad>, index 0):
+
+    predicted_ids = argmax_p log_probs[t, p]   for each t
+    predicted_phonemes = collapse_and_remove_blank(predicted_ids)
+
+5.3 Edit-Distance Alignment
+────────────────────────────
+Module: pronun/audio/gop_scorer.py — _edit_distance_align()
+
+The predicted phoneme sequence is aligned to the target IPA sequence using
+the standard edit-distance (Levenshtein) dynamic programming algorithm:
+
+  Let predicted = (p_1, ..., p_n), target = (q_1, ..., q_m)
+
+  DP recurrence:
+    dp[0][j] = j    (j deletions)
+    dp[i][0] = i    (i insertions)
+    dp[i][j] = dp[i-1][j-1]            if p_i == q_j   (match)
+             = 1 + min(                               otherwise:
+                   dp[i-1][j],          insertion
+                   dp[i][j-1],          deletion
+                   dp[i-1][j-1]         substitution
+               )
+
+Backtracing produces a sequence of (predicted_phoneme, target_phoneme) pairs,
+with None indicating an insertion or deletion.
+
+5.4 Frame Boundary Extraction
+───────────────────────────────
+Module: pronun/audio/gop_scorer.py — _get_frame_boundaries()
+
+For each non-blank predicted token, the consecutive run of frame indices
+assigned to that token gives its [start, end) frame range. These ranges are
+consumed in order during the alignment pass.
+
+5.5 GOP Formula [Witt & Young, 2000]
+──────────────────────────────────────
+For a target phoneme q_i spanning frames [t_s, t_e):
+
+                     1         t_e - 1
+    GOP(q_i) = ────────────  ·  ∑      log P(q_i | x_t)
+               t_e - t_s      t = t_s
+
+That is: the mean log-posterior probability assigned by wav2vec2 to the
+target phoneme over its temporal window.
+
+  - If the phoneme is deleted (not found in predicted): GOP = GOP_MIN = -4.0
+  - If the target phoneme is not in the wav2vec2 vocabulary: GOP = GOP_MIN
+
+5.6 Normalization to 0–100
+───────────────────────────
+A linear map converts the raw GOP (negative log-probability) to a 0–100 scale:
+
+    audio_score(q_i) = clip( ───────────────────────── × 100,  0,  100 )
+                              GOP_MAX − GOP_MIN
+
+                     = clip( ──────────────── × 100,  0,  100 )
+                                −0.1 − (−4.0)
+
+Constants (config.py):
+    GOP_MIN = -4.0   →  score 0    (very wrong phoneme)
+    GOP_MAX = -0.1   →  score 100  (near-perfect phoneme)
+
+5.7 Overall Audio Score (Frame-Weighted Mean)
+──────────────────────────────────────────────
+The sentence-level audio score is a frame-duration-weighted average:
+
+                  Σ_i  frames(q_i) × audio_score(q_i)
+    audio_score = ─────────────────────────────────────
+                          Σ_i  frames(q_i)
+
+Weighting by frame count gives longer phonemes proportionally more influence.
+
+
+────────────────────────────────────────────────────────────────────────────────
+6. PIPELINE STAGE 3 — VISUAL FEATURE EXTRACTION
+────────────────────────────────────────────────────────────────────────────────
+
+6.1 MediaPipe FaceLandmarker [Lugaresi et al., 2019]
+──────────────────────────────────────────────────────
+Module: pronun/visual/features/landmark_extractor.py
+Model:  face_landmarker.task  (float16, ~28 MB, auto-downloaded to
+        ~/.cache/pronun/face_landmarker.task)
+
+Configuration:
+  - running_mode = VIDEO  (temporal tracking enabled)
+  - num_faces = 1
+  - min_face_detection_confidence = 0.5
+  - min_tracking_confidence = 0.5
+  - frame timestamp increments ~33 ms (30 fps)
+
+For each RGB frame the model returns 478 face landmarks in normalized
+coordinates (x, y ∈ [0,1]; z in depth-relative units). Pronun selects 40 lip
+landmarks and converts to pixel-space:
+
+    lm.x_px = lm.x × frame_width
+    lm.y_px = lm.y × frame_height
+    lm.z_px = lm.z × frame_width      (depth scaled by width)
+
+Selected landmark indices:
+  Outer lip (20): 61,146, 91,181, 84, 17,314,405,321,375,
+                 291,409,270,269,267,  0, 37, 39, 40,185
+  Inner lip (20): 78,191, 80, 81, 82, 13,312,311,310,415,
+                 308,324,318,402,317, 14, 87,178, 88, 95
+
+Output per frame: array of shape (40, 3)  [x, y, z in pixel space]
+                  or None if no face detected.
+
+6.2 Normalization [Cootes et al., 1995]
+─────────────────────────────────────────
+Module: pronun/visual/features/normalizer.py
+
+To remove head pose and face-size variation, two steps are applied:
+
+Step 1 — Centering (zero the centroid):
+
+                     1   40
+    centroid = ────  ∑   lm_i       (mean over all 40 landmarks, 3D)
+               40  i=1
+
+    centered_i = lm_i − centroid
+
+Step 2 — Scale normalization (unit mouth width):
+
+    width = ||centered_LEFT_CORNER − centered_RIGHT_CORNER||_2
+
+           centered_i
+    L_i = ────────────       (width = 1 after normalization)
+              width
+
+    LEFT_CORNER  = landmark index 61  (left lip corner)
+    RIGHT_CORNER = landmark index 291 (right lip corner)
+
+After normalization, mouth width = 1.0 for all speakers and head distances.
+
+6.3 Feature Vector Construction — 248 dimensions
+──────────────────────────────────────────────────
+Module: pronun/visual/features/feature_builder.py
+
+For each frame with valid landmarks, a static feature vector f_t is built
+by concatenating four components:
+
+  ┌──────────────────────────────────────────────────────────────────┐
+  │  COMPONENT 1: Mouth height H  (1 dim)                           │
+  │                                                                  │
+  │    H = ||L_upper_mid − L_lower_mid||_2                          │
+  │                                                                  │
+  │    where L_upper_mid = normalized landmark 13 (upper lip mid)   │
+  │          L_lower_mid = normalized landmark 14 (lower lip mid)   │
+  ├──────────────────────────────────────────────────────────────────┤
+  │  COMPONENT 2: Opening ratio R  (1 dim)                          │
+  │                                                                  │
+  │    R = H / W                                                     │
+  │                                                                  │
+  │    Since W = 1 after normalization: R = H                       │
+  ├──────────────────────────────────────────────────────────────────┤
+  │  COMPONENT 3: Lip protrusion P  (1 dim)                         │
+  │                                                                  │
+  │    P = mean(z of upper outer lip points) − mean(z of lower      │
+  │            outer lip points)                                     │
+  │                                                                  │
+  │    Captures forward/backward lip movement (bilabial rounding).  │
+  ├──────────────────────────────────────────────────────────────────┤
+  │  COMPONENT 4: 2D mouth area A  (1 dim)                          │
+  │                                                                  │
+  │    A = area of 2D convex hull of all 40 normalized landmarks     │
+  │        (x-y projection only; computed via scipy ConvexHull)     │
+  ├──────────────────────────────────────────────────────────────────┤
+  │  COMPONENT 5: Flattened 3D landmarks  (40 × 3 = 120 dims)       │
+  │                                                                  │
+  │    [x_1, y_1, z_1,  x_2, y_2, z_2,  ...,  x_40, y_40, z_40]   │
+  └──────────────────────────────────────────────────────────────────┘
+
+  Static feature vector:  f_t ∈ R^(4 + 120) = R^124
+
+Delta features (velocity) are appended to capture temporal dynamics:
+
+    Δf_t = f_t − f_{t−1}     (for t ≥ 1)
+    Δf_0 = 0                  (zero-padded for the first frame)
+
+Final feature vector with deltas:
+
+    F_t = concat(f_t, Δf_t) ∈ R^(124 + 124) = R^248
+
+The complete observation matrix for a sentence is:
+
+    O ∈ R^{T × 248}    (T = number of valid frames)
+
+
+────────────────────────────────────────────────────────────────────────────────
+7. PIPELINE STAGE 4 — VISUAL SCORING (GAUSSIAN HMM)
+────────────────────────────────────────────────────────────────────────────────
+
+7.1 Lee Viseme Map [Lee & Yook, 2002]
+───────────────────────────────────────
+Module: pronun/data/lee_map.py, pronun/visual/viseme/lee_viseme.py
+
+Visemes are visual units of speech — groups of phonemes that produce the same
+visible mouth shape. Lee & Yook's 13-class map groups the 44 ARPAbet phonemes:
+
+  ID  Label  ARPAbet phonemes
+  ──  ─────  ────────────────────────────────────────────────────
+   0  SIL    SIL, SP, SPN              (silence)
+   1  P      P, B, M                   (bilabial closure)
+   2  T      T, D, S, Z, TH, DH       (alveolar + dental)
+   3  K      K, G, NG, N, L, Y, HH    (velar/glottal + misc)
+   4  CH     CH, JH, SH, ZH           (postalveolar)
+   5  F      F, V                      (labiodental)
+   6  W      R, W                      (lip rounding)
+   7  IY     IY, IH                    (high front vowels)
+   8  EY     EY, EH, AE               (mid front vowels)
+   9  AA     AA, AW, AY, AH           (low/open vowels)
+  10  AO     AO, OY, OW               (back rounded vowels)
+  11  UH     UH, UW                    (high back vowels)
+  12  ER     ER, AX                    (r-colored vowel / schwa)
+
+Usage: the target text is converted via G2P to ARPAbet, then each phoneme is
+looked up in the table to yield a viseme sequence V = (v_1, v_2, ..., v_N).
+
+7.2 Mode A — K-Means Viseme Clustering
+────────────────────────────────────────
+Module: pronun/visual/viseme/kmeans_viseme.py
+
+A KMeansViseme model (k=12, random_state=42) is trained offline on speaker
+feature vectors and saved to disk. At inference time:
+
+  1. For each frame, the 248-dim feature vector is assigned to the nearest
+     cluster centroid.
+  2. The resulting sequence of cluster IDs serves as the predicted viseme
+     sequence in place of the Lee-map sequence.
+
+NOTE: Mode A requires a pre-trained KMeansViseme object; without it, only
+Mode B runs.
+
+7.3 Left-to-Right Gaussian HMM [Rabiner, 1989]
+───────────────────────────────────────────────
+Module: pronun/visual/scoring/hmm.py — GaussianHMM
+
+One HMM is constructed per utterance to match the expected viseme sequence.
+The number of states equals the length of the viseme sequence N.
+
+Topology: LEFT-TO-RIGHT — from any state i, only a self-loop (stay in i) or
+          a forward transition to i+1 is allowed. The last state must self-loop.
+
+  Transition matrix (in log-space):
+
+    A[i][i]   = log(p_self)          where p_self = 0.5 (default)
+    A[i][i+1] = log(1 − p_self)      for i < N − 1
+    A[N-1][N-1] = log(1.0)           last state always self-loops
+
+  Initial state distribution:
+
+    π_0 = 1.0  (start in state 0)
+    π_i = 0.0  for i > 0
+
+7.4 Gaussian Emission Distribution
+────────────────────────────────────
+Each state s has a multivariate Gaussian emission distribution:
+
+    P(f_t | state = s) = N(f_t ;  μ_s,  Σ_s)
+
+               1                              1
+    = ───────────────────── · exp( − ──  (f_t − μ_s)^T  Σ_s^{-1}  (f_t − μ_s) )
+      (2π)^{d/2} |Σ_s|^{1/2}          2
+
+where d = 248 (feature dimension).
+
+Covariance regularization to prevent singular matrices:
+
+    Σ_s ← Σ_s + λI     with λ = HMM_COV_REGULARIZATION = 1×10^{-4}
+
+Training (per state):
+  Given labeled observations X_s = {x_1, ..., x_n} for state s:
+
+         1   n
+    μ_s = ─  ∑  x_k
+         n  k=1
+
+         1     n
+    Σ_s = ───  ∑  (x_k − μ_s)(x_k − μ_s)^T
+         n−1  k=1
+
+NOTE: Until training data is collected and train_emissions() is called,
+defaults are μ_s = 0 and Σ_s = I for all states.
+
+7.5 Forward Algorithm [Rabiner, 1989]
+───────────────────────────────────────
+Module: pronun/visual/scoring/hmm.py — GaussianHMM.forward()
+
+The Forward Algorithm computes the total log-likelihood of an observation
+sequence O = (f_1, ..., f_T) given the HMM, summing over all state paths.
+
+Define the forward variable:
+    α_t(s) = P(f_1, f_2, ..., f_t,  state_t = s  |  HMM)
+
+  Initialization (t = 1):
+    α_1(s) = π_s · P(f_1 | s)
+                                    → in log-space:
+    log α_1(s) = log π_s + log P(f_1 | s)
+
+  Induction (t = 2, ..., T):
+    α_t(s') = [ Σ_s  α_{t-1}(s) · A[s, s'] ] · P(f_t | s')
+                                    → in log-space (log-sum-exp trick):
+    log α_t(s') = logSumExp_s( log α_{t-1}(s) + log A[s, s'] )
+                  + log P(f_t | s')
+
+  Termination:
+    log P(O | HMM) = logSumExp_s( log α_T(s) )
+
+The log-sum-exp trick prevents numerical underflow:
+
+    logSumExp(v) = max(v) + log Σ_i exp(v_i − max(v))
+
+7.6 Reference Baseline
+────────────────────────
+Module: pronun/visual/scoring/reference.py — ReferenceBaseline
+
+The raw log-likelihood grows with sequence length. To normalize:
+
+    L_norm = log P(O | HMM) / T       (per-frame average)
+
+A reference value L_ref is the mean L_norm computed from native speakers
+pronouncing the same text with trained HMMs:
+
+                1   M
+    L_ref(w) = ───  ∑  L_norm_k(w)
+               M  k=1
+
+where M is the number of native-speaker samples for word w.
+
+Default: L_ref = −5.0 (used when no word-specific reference is available).
+
+7.7 Visual Score Formula
+──────────────────────────
+Module: pronun/visual/scoring/visual_scorer.py
+
+    visual_score = 100 · min(1,  exp( L_norm − L_ref ))
+
+  where:
+    L_norm = log P(O | HMM) / T
+    L_ref  = reference normalized log-likelihood for native speakers
+
+Interpretation:
+  - If L_norm == L_ref: exp(0) = 1.0 → score = 100
+  - If L_norm < L_ref:  exp(negative) < 1 → score < 100
+  - If L_norm > L_ref:  exp(positive) > 1 → capped at 100
+
+NOTE: With untrained HMMs, L_norm ≈ −300 per frame for d=248 features.
+Combined with L_ref = −5.0, this gives exp(−295) ≈ 0, so visual_score = 0
+until training is completed.
+
+
+────────────────────────────────────────────────────────────────────────────────
+8. PIPELINE STAGE 5 — SCORE COMBINATION
+────────────────────────────────────────────────────────────────────────────────
+
+8.1 Per-Phoneme Adaptive Combination
+──────────────────────────────────────
+Module: pronun/scoring/combiner.py — adaptive_combine()
+
+The combined score for phoneme p is:
+
+    combined(p) = w_audio(p) · audio_score(p)  +  w_visual(p) · visual_score
+
+where the weights depend on the phoneme's visual distinctiveness:
+
+  Phoneme class                  Phonemes                w_audio  w_visual
+  ─────────────────────────────  ──────────────────────  ───────  ────────
+  Visually distinctive           P, B, M (bilabial)       0.50     0.50
+  (VISUAL_DISTINCTIVE_PHONEMES)  F, V (labiodental)
+                                 W, UW, OW, AO (rounded)
+  All others                     (default)                0.90     0.10
+
+Note: The code applies AMBIGUOUS weights (0.90/0.10) to all phonemes not in
+VISUAL_DISTINCTIVE_PHONEMES, including the DEFAULT_AUDIO_WEIGHT = 0.70 /
+DEFAULT_VISUAL_WEIGHT = 0.30 which are used only in the non-adaptive
+combine_scores() helper.
+
+If use_camera=False or no face was detected, visual_score = None and:
+
+    combined(p) = audio_score(p)    (audio-only fallback)
+
+8.2 Word Score
+───────────────
+Each word's score is the mean combined score of its constituent phonemes:
+
+                         1       end(w)
+    word_score(w) = ──────────   ∑      combined(p_i)
+                    end(w)−start(w)  i=start(w)
+
+8.3 Sentence Score
+───────────────────
+The sentence score is the mean of all word scores:
+
+                       1   W
+    sentence_score = ───   ∑  word_score(w_j)
+                     W   j=1
+
+where W = number of words in the sentence.
+
+8.4 Score-to-Level Mapping
+───────────────────────────
+All scores are on 0–100. The following thresholds determine feedback level:
+
+    Score range    Level         Color
+    ───────────    ──────────    ──────
+     85 – 100      excellent     green
+     70 –  84      good          blue
+     50 –  69      fair          yellow
+      0 –  49      needs_work    red
+
+
+────────────────────────────────────────────────────────────────────────────────
+9. FEEDBACK AND SESSION TRACKING
+────────────────────────────────────────────────────────────────────────────────
+
+9.1 Per-Phoneme Audio Tips
+───────────────────────────
+Module: pronun/scoring/feedback.py — PHONEME_TIPS
+
+Pre-written improvement tips are stored for 26 IPA phonemes, focusing on
+sounds commonly mispronounced by Mandarin speakers:
+
+  Phoneme  Tip summary
+  ───────  ──────────────────────────────────────────────────────────────
+  θ (th)   Tongue tip between teeth, blow gently (voiceless "think")
+  ð (th)   Tongue tip between teeth, vibrate cords (voiced "the")
+  ɹ (r)    Curl tongue back, lips slightly rounded
+  l        Tongue tip firmly on alveolar ridge
+  v        Bite lower lip with upper teeth, vibrate; don't use /w/
+  z        Like /s/ with voicing
+  ʒ        Like /ʃ/ with voicing ("measure")
+  dʒ       Tongue on palate, release into /ʒ/
+  b        Voiced bilabial, distinct from /p/
+  d        Voiced alveolar, distinct from /t/
+  ɡ        Voiced velar, distinct from /k/
+  æ        Mouth wide open, tongue low and front ("cat")
+  ɪ        Short relaxed /i/ ("sit")
+  ʊ        Short relaxed /u/, lips slightly rounded ("put")
+  ʌ        Short open "uh" ("cup")
+  ɛ        Open /e/, mouth more open than for /eɪ/ ("bed")
+  ɝ        R-colored vowel, curl tongue while saying "er" ("bird")
+  ə        Schwa — most relaxed vowel, quick unstressed "uh"
+  aɪ       Glide from open /a/ to /i/ ("buy")
+  aʊ       Glide from open /a/ to /u/ ("how")
+  oʊ       Glide from /o/ to slight /u/, rounded lips
+  eɪ       Glide from /ɛ/ to /i/ ("say")
+  ɔɪ       Glide from /ɔ/ to /i/ ("boy")
+
+9.2 Per-Viseme Mouth-Shape Tips
+─────────────────────────────────
+Module: pronun/scoring/feedback.py — VISEME_TIPS, VISEME_PHONEME_EXAMPLES
+
+Pre-written mouth-shape instructions are stored for all 13 Lee visemes.
+Silence (ID 0) is skipped. Displayed in the "Visual Tips" panel in the CLI.
+
+  ID  Label  Sounds         Mouth-shape instruction (summary)
+  ──  ─────  ─────────────  ─────────────────────────────────────────────────
+   1  P      P, B, M        Press both lips firmly together, then release
+   2  T      T,D,S,Z,TH,DH  Tongue tip to ridge behind upper teeth
+   3  K      K,G,N,L,Y,H    Back of tongue toward soft palate, lips neutral
+   4  CH     CH,J,SH,ZH     Teeth close together, lips slightly rounded
+   5  F      F, V           Upper teeth rest lightly on lower lip
+   6  W      R, W           Round and slightly protrude both lips
+   7  IY     EE, IH         Spread lips wide (smile shape), tongue high
+   8  EY     AY, EH, AE     Open mouth moderately, lips spread, tongue mid
+   9  AA     AH, OW, AW     Drop jaw wide open, lips relaxed, tongue low
+  10  AO     AW, OY, OH     Round lips into forward 'O', jaw moderately open
+  11  UH     UH, OO         Tight rounded lips, jaw nearly closed
+  12  ER     ER             Lips slightly parted, curl tongue tip back
+
+  generate_visual_feedback(viseme_sequence, visual_score)
+    Returns list of {viseme_id, viseme_label, phoneme_examples, tip} for
+    unique non-SIL visemes in order of appearance. Returns [] if
+    visual_score is None (camera disabled).
+
+9.3 Feedback Generation
+─────────────────────────
+  generate_feedback(phoneme_scores)   → list of {phoneme, score, level, tip}
+  generate_word_feedback(word_scores) → list of {word, score, level}
+  overall_feedback(score, word_scores) → summary message string
+  generate_visual_feedback(viseme_sequence, visual_score)
+                                      → list of {viseme_id, viseme_label,
+                                                 phoneme_examples, tip}
+
+Tips are omitted at "excellent" level. Weak words (score < 70) are named
+in the overall feedback message.
+
+9.4 Session Tracking
+─────────────────────
+Module: pronun/workflow/tracker.py — SessionTracker
+
+Stores practice_sentence() results in memory for the current session.
+A result is only recorded if audio_score > 0 AND (visual_score is None
+OR visual_score > 0). This prevents failed/silent recordings from
+polluting the progress history.
+
+Supports:
+  - get_history(sentence)  — all attempts for one sentence
+  - get_trend(sentence)    — list of combined_scores over time
+  - summary()              — total_attempts, avg_score, best_score,
+                             improvement = last_score − first_score
+
+The trend line in the CLI shows score history and delta from the previous
+attempt after 2 or more attempts on the same sentence.
+
+
+────────────────────────────────────────────────────────────────────────────────
+10. CLI REFERENCE
+────────────────────────────────────────────────────────────────────────────────
+
+All commands are run from the repository root:
+
+    python -m pronun.cli <command> [options]
+
+10.1 practice — Interactive Sentence Practice
+───────────────────────────────────────────────
+    python -m pronun.cli practice [--level LEVEL] [--index N]
+                                  [--mode MODE] [--no-camera]
+
+  --level    beginner | intermediate | advanced   (default: beginner)
+  --index N  Start at sentence N from the level list (0-based)
+  --mode     A | B | both   (default: B)
+  --no-camera               Audio-only mode
+
+  Interactive controls after each attempt:
+    Enter   Next random sentence
+    r       Retry same sentence
+    p       Show session progress table
+    q       Quit (shows final summary)
+
+  Output per attempt:
+    - Sentence Overview panel  (sentence score, audio, visual)
+    - Word Scores table        (per-word score and level)
+    - Phoneme Details table    (per-phoneme score, level, audio tip)
+    - Feedback panel           (overall message)
+    - Visual Tips panel        (per-viseme mouth-shape advice; hidden if
+                                camera off or visual score == 0)
+    - Trend line               (score history, after ≥2 attempts)
+
+10.2 practice-word — Single-Word Practice
+───────────────────────────────────────────
+    python -m pronun.cli practice-word [WORD ...] [--mode MODE] [--no-camera]
+
+  Defaults to the first 3 beginner words if no words given.
+
+10.3 list — List Practice Sentences
+─────────────────────────────────────
+    python -m pronun.cli list [beginner|intermediate|advanced|focus|all]
+
+  focus shows 6 phoneme-contrast groups of 4 sentences each.
+
+10.4 list-words — List Practice Words
+───────────────────────────────────────
+    python -m pronun.cli list-words [beginner|intermediate|advanced|focus|all]
+
+10.5 compare — Compare Mode A vs Mode B
+─────────────────────────────────────────
+    python -m pronun.cli compare WORD
+
+  Runs mode="both", shows both visual scores side by side.
+
+10.6 progress — Explain Progress Command
+──────────────────────────────────────────
+    python -m pronun.cli progress
+
+  Displays a reminder to use 'p' inside an interactive session.
+
+10.7 Example Invocations
+─────────────────────────
+    python -m pronun.cli practice
+    python -m pronun.cli practice --level advanced --mode B
+    python -m pronun.cli practice --no-camera --level intermediate
+    python -m pronun.cli practice-word pronunciation environment
+    python -m pronun.cli list focus
+    python -m pronun.cli compare hello
+
+
+────────────────────────────────────────────────────────────────────────────────
+11. CONFIGURATION CONSTANTS (config.py)
+────────────────────────────────────────────────────────────────────────────────
+
+  Constant                       Value    Description
+  ────────────────────────────── ──────   ──────────────────────────────────
+  SAMPLE_RATE                    16000    Audio sample rate (Hz)
+  CHANNELS                       1        Mono audio
+  SILENCE_THRESHOLD              0.02     RMS amplitude below which = silence
+  SILENCE_DURATION               1.5      Seconds of silence to stop recording
+  MAX_RECORD_SECONDS             10       Hard recording limit
+  WAV2VEC2_MODEL                 (HF id)  facebook/wav2vec2-lv-60-espeak-cv-ft
+  GOP_MIN                        -4.0     Raw GOP → score 0
+  GOP_MAX                        -0.1     Raw GOP → score 100
+  CAMERA_INDEX                   0        OpenCV camera index
+  CAMERA_FPS                     30       Video capture frame rate
+  HMM_COV_REGULARIZATION         1e-4     Covariance regularization λ
+  KMEANS_K                       12       Number of K-means clusters (Mode A)
+  DEFAULT_AUDIO_WEIGHT           0.70     combine_scores() audio weight
+  DEFAULT_VISUAL_WEIGHT          0.30     combine_scores() visual weight
+  DISTINCTIVE_AUDIO_WEIGHT       0.50     Visually distinctive phoneme audio w.
+  DISTINCTIVE_VISUAL_WEIGHT      0.50     Visually distinctive phoneme visual w.
+  AMBIGUOUS_AUDIO_WEIGHT         0.90     Other phoneme audio weight
+  AMBIGUOUS_VISUAL_WEIGHT        0.10     Other phoneme visual weight
+  FACE_LANDMARKER_MODEL_PATH     ~/.cache/pronun/face_landmarker.task
+
+
+────────────────────────────────────────────────────────────────────────────────
+12. KNOWN LIMITATIONS
+────────────────────────────────────────────────────────────────────────────────
+
+12.1 Visual Scoring Status
+───────────────────────────
+Visual scoring (Mode B) is now functional with trained models. The
+repository ships models/hmm_emissions.npz and models/reference_baseline.npz
+which are loaded automatically by Session.__init__() if present.
+
+Remaining limitation: Mode A (KMeansViseme) still has no trained model.
+KMeansViseme(k=12).train(all_features) has not been run; passing a trained
+model to Session(kmeans_model=...) is required to enable Mode A.
+
+12.2 SSL Certificates on macOS Python 3.13
+────────────────────────────────────────────
+urllib.request.urlretrieve() may fail silently if Python's SSL root
+certificates are not installed, preventing the FaceLandmarker model download.
+Fix: run /Applications/Python 3.13/Install Certificates.command, then
+restart Terminal.
+
+12.3 Empty "Word" Column in Phoneme Details Table
+───────────────────────────────────────────────────
+_phoneme_to_word() in cli.py looks up phoneme_start/phoneme_end from
+word_scores, but generate_word_feedback() strips those keys before returning.
+The word label will be blank. Fix: use word_segments from the result dict.
+
+12.4 Per-Phoneme Visual Scoring Not Implemented
+─────────────────────────────────────────────────
+One sentence-level visual score is applied to all phonemes uniformly.
+To score each phoneme individually, GOP frame timestamps would need to be
+used to slice the video frames and run a separate HMM forward pass per
+phoneme window.
+
+12.5 Dead Code: audio/recorder.py
+───────────────────────────────────
+record_audio() is never called. Session uses SyncRecorder (recorder_sync.py)
+for all audio capture.
+
+
+────────────────────────────────────────────────────────────────────────────────
+13. REFERENCES AND CITATIONS
+────────────────────────────────────────────────────────────────────────────────
+
+[1] Baevski, A., Zhou, Y., Mohamed, A., & Auli, M. (2020).
+    wav2vec 2.0: A Framework for Self-Supervised Learning of Speech
+    Representations.
+    Advances in Neural Information Processing Systems (NeurIPS), 33, 12449–12460.
+    https://arxiv.org/abs/2006.11477
+
+    Used for: wav2vec2-lv-60-espeak-cv-ft model — phoneme posterior
+    probabilities P(phoneme | frame, audio).
+
+[2] Graves, A., Fernández, S., Gomez, F., & Schmidhuber, J. (2006).
+    Connectionist Temporal Classification: Labelling Unsegmented Sequence
+    Data with Recurrent Neural Networks.
+    Proceedings of the 23rd International Conference on Machine Learning
+    (ICML), 369–376.
+    https://dl.acm.org/doi/10.1145/1143844.1143891
+
+    Used for: CTC decoding (greedy argmax + blank collapse) to convert
+    frame-level log-probs to a phoneme sequence.
+
+[3] Witt, S. M., & Young, S. J. (2000).
+    Phone-level Pronunciation Scoring and Assessment for Interactive Language
+    Learning.
+    Speech Communication, 30(2–3), 95–108.
+    https://doi.org/10.1016/S0167-6393(99)00044-8
+
+    Used for: the GOP (Goodness of Pronunciation) formula:
+        GOP(q) = (1/Δt) Σ log P(q | x_t)
+
+[4] Rabiner, L. R. (1989).
+    A Tutorial on Hidden Markov Models and Selected Applications in Speech
+    Recognition.
+    Proceedings of the IEEE, 77(2), 257–286.
+    https://doi.org/10.1109/5.18626
+
+    Used for: left-to-right HMM structure, Gaussian emission model,
+    Forward Algorithm (α-recursion and log-sum-exp termination).
+
+[5] Lee, B., & Yook, D. (2002).
+    Audio-to-Visual Conversion Using Hidden Markov Models.
+    Pacific Rim International Conference on Artificial Intelligence,
+    Lecture Notes in Computer Science, vol. 2417, 243–251.
+    https://doi.org/10.1007/3-540-45683-X_27
+
+    Used for: the 13-class ARPAbet-to-viseme mapping table implemented
+    in pronun/data/lee_map.py.
+
+[6] Lugaresi, C., Tang, J., Nash, H., McClanahan, C., Uboweja, E., Hays, M.,
+    Zhang, F., Chang, C.-L., Yong, M. G., Lee, J., Chang, W.-T., Hua, W.,
+    Georg, M., & Grundmann, M. (2019).
+    MediaPipe: A Framework for Perceiving and Processing Reality.
+    Third Workshop on Computer Vision for AR/VR at CVPR 2019.
+    https://arxiv.org/abs/1906.08172
+
+    Used for: FaceLandmarker model — real-time 3D face landmark detection
+    (478 landmarks, VIDEO running mode).
+
+[7] Cootes, T. F., Taylor, C. J., Cooper, D. H., & Graham, J. (1995).
+    Active Shape Models — Their Training and Application.
+    Computer Vision and Image Understanding, 61(1), 38–59.
+    https://doi.org/10.1006/cviu.1995.1004
+
+    Used for: landmark centering and scale normalization strategy
+    (subtract centroid, normalize by inter-point distance).
+
+[8] Park, K., & Mulc, T. (2019).
+    g2p-en: A Simple Python Module for English Grapheme-to-Phoneme Conversion.
+    Proceedings of Interspeech 2019.
+    https://github.com/Kyubyong/g2p
+
+    Used for: text_to_arpabet() — converts English text to ARPAbet phoneme
+    sequences, backed by the CMU Pronouncing Dictionary.
+
+[9] CMU Pronouncing Dictionary (CMUdict).
+    Carnegie Mellon University, version 0.7b.
+    http://www.speech.cs.cmu.edu/cgi-bin/cmudict
+
+    Used indirectly via g2p-en for pronunciation lookup.
+
+[10] Grosman, J. (2021).
+     Fine-tuned XLS-R 300M — IPA on Common Voice 7.0.
+     HuggingFace model: facebook/wav2vec2-lv-60-espeak-cv-ft.
+     https://huggingface.co/facebook/wav2vec2-lv-60-espeak-cv-ft
+
+     Used for: the fine-tuned model weights providing IPA phoneme posteriors.
+
+================================================================================
+End of documentation.
+================================================================================

@@ -63,7 +63,7 @@ The system is a pronunciation correction tool combining audio (GOP) and visual (
    - **Mode B** (default): `LeeViseme.text_to_viseme_sequence()` maps text → viseme IDs; `VisualScorer.build_hmm()` + `score()` runs Forward Algorithm on a `GaussianHMM`
    - **Mode A**: `KMeansViseme` clusters frames into viseme IDs instead
 6. **Combine**: `adaptive_combine()` (`scoring/combiner.py`) weights audio vs. visual per phoneme — bilabial phonemes (P, B, M, F, V, W…) get 50/50; visually ambiguous get 90/10
-7. **Feedback**: `generate_feedback()` / `generate_word_feedback()` produce per-phoneme and per-word dicts; `SessionTracker` records in-memory history
+7. **Feedback**: `generate_feedback()` / `generate_word_feedback()` produce per-phoneme and per-word dicts; `generate_visual_feedback()` produces per-viseme mouth-shape tips (shown in a "Visual Tips" panel parallel to phoneme tips); `SessionTracker` records in-memory history — skipped if `audio_score == 0` or `visual_score == 0` (camera enabled but failed)
 
 ### Sub-package responsibilities
 
@@ -73,7 +73,7 @@ The system is a pronunciation correction tool combining audio (GOP) and visual (
 | `visual/features/` | `landmark_extractor.py`, `normalizer.py`, `feature_builder.py` | MediaPipe face landmarks → normalized feature vectors |
 | `visual/scoring/` | `hmm.py`, `visual_scorer.py`, `reference.py` | Gaussian HMM Forward Algorithm, log-likelihood → 0-100 score |
 | `visual/viseme/` | `lee_viseme.py`, `kmeans_viseme.py` | ARPAbet→viseme (Lee map) and K-means viseme clustering |
-| `scoring/` | `combiner.py`, `feedback.py` | Adaptive audio/visual weighting, human-readable feedback |
+| `scoring/` | `combiner.py`, `feedback.py` | Adaptive audio/visual weighting, human-readable phoneme feedback + per-viseme mouth-shape tips |
 | `workflow/` | `session.py`, `recorder_sync.py`, `camera.py`, `tracker.py` | Orchestration, A/V capture, progress tracking |
 | `data/` | `word_lists.py`, `sentence_lists.py`, `lee_map.py` | Practice content, ARPAbet→viseme ID table |
 
@@ -103,7 +103,6 @@ The visual scoring pipeline is fully implemented but produces 0 because two thin
 | 1 | **Build viseme data collection pipeline** — record speakers, extract 254-dim lip feature vectors, label by viseme ID (0–12) | ✅ Complete | `grid_corpus.py` + `GridCorpusFeatureExtractor` |
 | 2 | **Train HMM emission parameters** — call `hmm.train_emissions(viseme_id, observations)` per viseme, save to disk, load in `Session` | ✅ Complete | `train_hmm_emissions.py` |
 | 3 | **Calibrate `ReferenceBaseline`** — record native speakers, run trained HMM Forward Algorithm, compute universal (μ_ref, σ_ref) | ✅ Complete | `calibrate_reference.py` |
-| 4 | **Train `KMeansViseme` (Mode A)** — call `KMeansViseme(k=12).train(all_features)`, save model, load in `Session.__init__` | ⏳ Pending | Mode A implementation |
 
 **Visual scoring is now functional with trained models!** Tasks #2-3 enable non-zero visual scores.
 
@@ -111,6 +110,7 @@ The visual scoring pipeline is fully implemented but produces 0 because two thin
 
 | # | Task | Notes |
 |---|------|-------|
+| 4 | **Train `KMeansViseme` (Mode A)** — call `KMeansViseme(k=12).train(all_features)`, save model, load in `Session.__init__` | ⏳ Pending | Mode A implementation |
 | 5 | **Fix SSL certificates permanently on macOS** | `landmark_extractor._ensure_model()` fails silently on python.org Python 3.13; disables visual scoring with no output. Workaround: `_create_unverified_context` fallback or run `/Applications/Python 3.13/Install Certificates.command` |
 | 6 | **Per-phoneme visual scoring** | `adaptive_combine()` applies one sentence-level visual score to all phonemes. Should use GOP frame timestamps to slice video frames per phoneme and score each separately |
 | 7 | **Remove dead code `audio/recorder.py`** | `record_audio()` is never called; `Session` uses `SyncRecorder` instead |

@@ -18,6 +18,7 @@ from pronun.scoring.feedback import (
     generate_feedback,
     generate_word_feedback,
     overall_feedback,
+    generate_visual_feedback,
 )
 from pronun.visual.features.feature_builder import build_feature_sequence
 from pronun.visual.features.landmark_extractor import LandmarkExtractor
@@ -302,6 +303,10 @@ class Session:
             fb = generate_feedback(per_phoneme)
             overall_msg = overall_feedback(combined)
 
+            vis_seq = (visual_results.get("visual_details_b") or {}).get("viseme_sequence", []) \
+                      or (visual_results.get("visual_details_a") or {}).get("viseme_sequence", [])
+            visual_fb = generate_visual_feedback(vis_seq, visual_score)
+
             return {
                 "word": word,
                 "target_phonemes": target_ipa,
@@ -315,6 +320,7 @@ class Session:
                 "phoneme_details": per_phoneme,
                 "feedback": fb,
                 "overall_feedback": overall_msg,
+                "visual_feedback": visual_fb,
             }
         finally:
             if os.path.exists(audio_path):
@@ -387,6 +393,10 @@ class Session:
             phoneme_fb = generate_feedback(per_phoneme)
             overall_msg = overall_feedback(sentence_score, word_scores)
 
+            vis_seq = (visual_results.get("visual_details_b") or {}).get("viseme_sequence", []) \
+                      or (visual_results.get("visual_details_a") or {}).get("viseme_sequence", [])
+            visual_fb = generate_visual_feedback(vis_seq, visual_score)
+
             practice_result = {
                 "sentence": sentence,
                 "sentence_score": sentence_score,
@@ -402,9 +412,11 @@ class Session:
                 "phoneme_details": per_phoneme,
                 "feedback": phoneme_fb,
                 "overall_feedback": overall_msg,
+                "visual_feedback": visual_fb,
             }
 
-            self.tracker.record(practice_result)
+            if audio_score > 0 and (visual_score is None or visual_score > 0):
+                self.tracker.record(practice_result)
             return practice_result
 
         finally:

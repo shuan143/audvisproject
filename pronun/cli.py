@@ -17,6 +17,7 @@ from pronun.data.sentence_lists import (
 )
 from pronun.audio.g2p import ARPABET_TO_IPA
 from pronun.data.lee_map import arpabet_to_viseme, LEE_VISEME_LABELS
+from pronun.scoring.feedback import EXCELLENT_THRESHOLD
 
 # Reverse map: IPA symbol → Lee viseme label (e.g. "p" → "P", "æ" → "EY")
 _IPA_TO_VISEME_LABEL: dict[str, str] = {
@@ -84,9 +85,10 @@ def show_score_table(result: dict):
         f"{result['overall_feedback']}"
     )
     console.print(Panel(panel_text, title="Score Summary"))
-    
+
     # Visual scoring debug information
     _show_visual_debug_info(result)
+    _show_visual_feedback(result)
 
 
 def _show_visual_debug_info(result: dict):
@@ -127,6 +129,45 @@ def _show_visual_debug_info(result: dict):
         debug_text = "\n".join(debug_lines)
         console.print(Panel(debug_text, title="[cyan]Visual Scoring Debug Information[/cyan]", 
                           border_style="cyan"))
+
+
+def _show_visual_feedback(result: dict):
+    """Display per-viseme mouth-shape tips (parallel to audio phoneme tips)."""
+    vf = result.get("visual_feedback")
+    visual_score = result.get("visual_score")
+
+    if visual_score is None:
+        # Camera disabled — no visual feedback to show
+        return
+
+    if not vf:
+        if visual_score >= EXCELLENT_THRESHOLD:
+            console.print(Panel(
+                "[green]Excellent visual articulation![/green]",
+                title="Visual Tips",
+            ))
+        return
+
+    score_color = _score_color(visual_score)
+    header = (
+        f"Visual Score: [{score_color}]{visual_score:.1f}/100[/{score_color}]  "
+        "— Mouth-shape advice for this sentence:"
+    )
+
+    table = Table(title=None, show_header=True, header_style="bold magenta")
+    table.add_column("Viseme", style="magenta", width=7)
+    table.add_column("Sounds", style="yellow", width=18)
+    table.add_column("How to shape your mouth", style="white")
+
+    for item in vf:
+        table.add_row(
+            item["viseme_label"],
+            item["phoneme_examples"],
+            item["tip"] or "",
+        )
+
+    console.print(Panel(table, title=f"[magenta]Visual Tips[/magenta] — {header}"))
+    console.print()
 
 
 def show_sentence_result(result: dict):
@@ -191,7 +232,10 @@ def show_sentence_result(result: dict):
     # 4. Feedback panel
     console.print(Panel(result["overall_feedback"], title="Feedback"))
     console.print()
-    
+
+    # 5. Visual feedback panel (mouth-shape tips per viseme)
+    _show_visual_feedback(result)
+
     # Visual scoring debug information
     _show_visual_debug_info(result)
 
