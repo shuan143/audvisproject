@@ -69,6 +69,49 @@ def show_score_table(result: dict):
         f"{result['overall_feedback']}"
     )
     console.print(Panel(panel_text, title="Score Summary"))
+    
+    # Visual scoring debug information
+    _show_visual_debug_info(result)
+
+
+def _show_visual_debug_info(result: dict):
+    """Display detailed visual scoring debug information."""
+    debug_lines = []
+    
+    # Mode B debug info
+    if result.get("visual_details_b") is not None:
+        details = result["visual_details_b"]
+        debug_lines.append("=== Mode B Visual Scoring Debug ===")
+        debug_lines.append(f"L (log-likelihood): {details.get('log_likelihood', 'N/A'):.6f}")
+        debug_lines.append(f"L_norm (L/T): {details.get('log_likelihood_norm', 'N/A'):.6f}")
+        debug_lines.append(f"μ_ref (reference mean): {details.get('mu_ref', 'N/A'):.6f}")
+        debug_lines.append(f"σ_ref (reference std): {details.get('sigma_ref', 'N/A'):.6f}")
+        debug_lines.append(f"Score_raw: {details.get('score_raw', 'N/A'):.6f}")
+        debug_lines.append(f"Score (clamped): {details.get('score', 'N/A'):.6f}")
+        debug_lines.append(f"Confidence: {details.get('confidence', 'N/A'):.6f}")
+        if details.get('viseme_sequence'):
+            debug_lines.append(f"Viseme sequence: {details['viseme_sequence']}")
+        debug_lines.append("")
+    
+    # Mode A debug info
+    if result.get("visual_details_a") is not None:
+        details = result["visual_details_a"]
+        debug_lines.append("=== Mode A Visual Scoring Debug ===")
+        debug_lines.append(f"L (log-likelihood): {details.get('log_likelihood', 'N/A'):.6f}")
+        debug_lines.append(f"L_norm (L/T): {details.get('log_likelihood_norm', 'N/A'):.6f}")
+        debug_lines.append(f"μ_ref (reference mean): {details.get('mu_ref', 'N/A'):.6f}")
+        debug_lines.append(f"σ_ref (reference std): {details.get('sigma_ref', 'N/A'):.6f}")
+        debug_lines.append(f"Score_raw: {details.get('score_raw', 'N/A'):.6f}")
+        debug_lines.append(f"Score (clamped): {details.get('score', 'N/A'):.6f}")
+        debug_lines.append(f"Confidence: {details.get('confidence', 'N/A'):.6f}")
+        if details.get('viseme_sequence'):
+            debug_lines.append(f"Predicted visemes: {details['viseme_sequence']}")
+        debug_lines.append("")
+    
+    if debug_lines:
+        debug_text = "\n".join(debug_lines)
+        console.print(Panel(debug_text, title="[cyan]Visual Scoring Debug Information[/cyan]", 
+                          border_style="cyan"))
 
 
 def show_sentence_result(result: dict):
@@ -131,6 +174,9 @@ def show_sentence_result(result: dict):
     # 4. Feedback panel
     console.print(Panel(result["overall_feedback"], title="Feedback"))
     console.print()
+    
+    # Visual scoring debug information
+    _show_visual_debug_info(result)
 
 
 def show_trend_line(tracker, sentence: str):

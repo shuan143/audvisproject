@@ -9,8 +9,35 @@ __pycache__/
 # Downloaded models (auto-downloaded on first run)
 .cache/
 
+# Trained models and datasets
+models/
+grid_dataset/
+*.npz
+*.pkl
+*.joblib
+
+# Temporary files
+*.tmp.*
+pronun/cli.py.tmp.*
+
 # macOS
 .DS_Store
+Thumbs.db
 
 # Environment
 .env
+venv/
+
+# IDE
+.vscode/
+.idea/
+
+# Audio/video recordings (if any)
+*.wav
+*.mp3
+*.mp4
+*.mpg
+*.avi
+
+# Logs
+*.log

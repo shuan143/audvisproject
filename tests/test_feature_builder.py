@@ -30,7 +30,7 @@ def test_build_feature_sequence_with_deltas():
     assert len(seq) == 5
 
     static_dim = 4 + 3 * N
-    expected_dim = static_dim * 2  # static + delta
+    expected_dim = static_dim * 2 + 6  # static + delta + velocity
     for feat in seq:
         assert feat.shape == (expected_dim,)
 
@@ -39,7 +39,7 @@ def test_first_frame_delta_is_zero():
     norms = [_mock_normalized(seed=0), _mock_normalized(seed=1)]
     seq = build_feature_sequence(norms)
     static_dim = 4 + 3 * N
-    delta = seq[0][static_dim:]
+    delta = seq[0][static_dim:static_dim*2]  # Extract only delta portion, not velocity
     np.testing.assert_allclose(delta, 0.0)
 
 
@@ -50,7 +50,7 @@ def test_none_frames_skipped():
 
 
 def test_feature_dim_function():
-    expected = (4 + 3 * N) * 2
+    expected = (4 + 3 * N) * 2 + 6  # static + deltas + velocity
     assert feature_dim(N) == expected
 
 

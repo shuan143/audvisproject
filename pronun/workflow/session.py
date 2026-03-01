@@ -3,6 +3,7 @@
 import tempfile
 import os
 import sys
+from typing import Optional
 
 import numpy as np
 
@@ -18,8 +19,10 @@ from pronun.scoring.feedback import (
 from pronun.visual.features.feature_builder import build_feature_sequence
 from pronun.visual.features.landmark_extractor import LandmarkExtractor
 from pronun.visual.features.normalizer import normalize_sequence
-from pronun.visual.scoring.reference import ReferenceBaseline
+from pronun.visual.features.baseline_recorder import BaselineRecorder, ExponentialMovingAverageFilter
+from pronun.visual.scoring.reference import ReferenceBaseline, UniversalReferenceBaseline
 from pronun.visual.scoring.visual_scorer import VisualScorer
+from pronun.training.train_hmm_emissions import load_trained_emissions
 from pronun.visual.viseme.kmeans_viseme import KMeansViseme
 from pronun.visual.viseme.lee_viseme import LeeViseme
 from pronun.workflow.camera import Camera
@@ -35,15 +38,51 @@ class Session:
         use_camera: bool = True,
         mode: str = "both",  # "A", "B", or "both"
         kmeans_model: KMeansViseme | None = None,
+        enable_baseline_recording: bool = False,  # Disabled for speaker-independent system
+        ema_alpha: float = 0.15,
+        hmm_emissions_path: str | None = None,  # Path to trained HMM emissions
+        reference_baseline_path: str | None = None  # Path to calibrated baseline
     ):
         self.use_camera = use_camera
         self.mode = mode.upper()
         self.kmeans_model = kmeans_model
+        self.enable_baseline_recording = enable_baseline_recording
+        self.ema_alpha = ema_alpha
+        
         self.lee_viseme = LeeViseme()
-        self.visual_scorer = VisualScorer()
         self.landmark_extractor = None
         self.camera = None
         self.tracker = SessionTracker()
+        
+        # Load trained parameters if provided
+        self.trained_emissions = None
+        if hmm_emissions_path:
+            try:
+                self.trained_emissions = load_trained_emissions(hmm_emissions_path)
+                print(f"Loaded trained HMM emissions for {len(self.trained_emissions)} visemes")
+            except Exception as e:
+                print(f"Warning: Failed to load HMM emissions from {hmm_emissions_path}: {e}")
+        
+        # Load calibrated reference baseline if provided
+        reference_baseline = None
+        if reference_baseline_path:
+            try:
+                reference_baseline = UniversalReferenceBaseline()
+                reference_baseline.load(reference_baseline_path)
+                stats = reference_baseline.get_universal_statistics()
+                print(f"Loaded calibrated reference baseline: μ_ref={stats['mu']:.3f}, σ_ref={stats['sigma']:.3f}")
+            except Exception as e:
+                print(f"Warning: Failed to load reference baseline from {reference_baseline_path}: {e}")
+                reference_baseline = None
+        
+        # Initialize visual scorer with trained components
+        self.visual_scorer = VisualScorer(reference=reference_baseline)
+        
+        # EMA temporal smoothing for speaker-independent system
+        self.ema_filter: Optional[ExponentialMovingAverageFilter] = None
+        # Legacy baseline recorder (disabled by default)
+        self.baseline_recorder: Optional[BaselineRecorder] = None
+        self.baseline_ready = False
 
     def setup(self):
         """Initialize camera and landmark extractor if using video."""
@@ -52,6 +91,16 @@ class Session:
                 self.camera = Camera()
                 self.camera.open()
                 self.landmark_extractor = LandmarkExtractor()
+                
+                # Initialize EMA temporal smoothing for speaker-independent system
+                self.ema_filter = ExponentialMovingAverageFilter(alpha=self.ema_alpha)
+                
+                # Optional baseline recorder (disabled by default for speaker-independent system)
+                if self.enable_baseline_recording:
+                    self.baseline_recorder = BaselineRecorder(
+                        self.camera, self.landmark_extractor
+                    )
+                
             except (RuntimeError, AttributeError, ImportError, OSError) as e:
                 self.use_camera = False
                 self.camera = None
@@ -82,46 +131,129 @@ class Session:
         audio, video_frames = recorder.record(audio_path)
         return audio, video_frames, audio_path
 
+    def record_baseline_mouth_state(self, duration_seconds: float = 1.5) -> dict:
+        """Record baseline mouth state for adaptive normalization (Step 1 of online usage).
+        
+        User should maintain neutral mouth position during recording.
+        
+        Args:
+            duration_seconds: Duration to record baseline (1-2 seconds recommended).
+            
+        Returns:
+            Dict with baseline recording results.
+        """
+        if not self.baseline_recorder:
+            return {
+                "success": False,
+                "error": "Baseline recording not enabled or camera not available"
+            }
+        
+        result = self.baseline_recorder.record_baseline(duration_seconds)
+        if result.get("success", False):
+            self.baseline_ready = True
+        
+        return result
+    
+    def get_baseline_info(self) -> dict:
+        """Get information about the recorded baseline."""
+        if self.baseline_recorder:
+            return self.baseline_recorder.get_baseline_info()
+        return {"baseline_ready": False, "error": "Baseline recorder not available"}
+
     def _compute_visual_score(self, video_frames, text):
-        """Compute visual scores from video frames. Returns (score_a, score_b, score)."""
-        visual_score_a = None
-        visual_score_b = None
-        visual_score = None
+        """Compute visual scores from video frames. Returns detailed results."""
+        result = {
+            "visual_score_a": None,
+            "visual_score_b": None,
+            "visual_score": None,
+            "visual_details_a": None,
+            "visual_details_b": None,
+        }
 
         if not (self.use_camera and video_frames and self.landmark_extractor):
-            return visual_score_a, visual_score_b, visual_score
+            return result
 
         landmarks = self.landmark_extractor.extract_sequence(video_frames)
         normalized = normalize_sequence(landmarks)
         features = build_feature_sequence(normalized)
 
         if not features:
-            return visual_score_a, visual_score_b, visual_score
+            return result
+
+        # Apply adaptive normalization if baseline is available (legacy, disabled by default)
+        if self.baseline_recorder and self.baseline_recorder.is_baseline_ready():
+            try:
+                features = self.baseline_recorder.apply_adaptive_normalization(features)
+            except RuntimeError as e:
+                print(f"Warning: Adaptive normalization failed: {e}")
+
+        # Apply EMA temporal smoothing (speaker-independent)
+        if self.ema_filter:
+            self.ema_filter.reset_filter()  # Reset for new sequence
+            smoothed_features = []
+            for feature in features:
+                smoothed_feature = self.ema_filter.apply_filter(feature)
+                smoothed_features.append(smoothed_feature)
+            features = smoothed_features
 
         obs = np.array(features)
 
         if self.mode in ("B", "BOTH"):
             viseme_seq = self.lee_viseme.text_to_viseme_sequence(text)
-            hmm = self.visual_scorer.build_hmm(
-                viseme_seq, {}, obs.shape[1],
-            )
-            score_b = self.visual_scorer.score(hmm, obs, text)
-            visual_score_b = score_b["score"]
+            
+            # Build HMM (initially untrained)
+            hmm = self.visual_scorer.build_hmm(viseme_seq, {}, obs.shape[1])
+            
+            # Apply trained emission parameters if available
+            if self.trained_emissions:
+                hmm = self._apply_trained_emissions_to_hmm(hmm, viseme_seq)
+            
+            score_b = self.visual_scorer.score(hmm, obs, viseme_seq)
+            result["visual_score_b"] = score_b["score"]
+            result["visual_details_b"] = score_b
 
         if self.mode in ("A", "BOTH") and self.kmeans_model:
             pred_visemes = self.kmeans_model.predict(obs)
-            hmm = self.visual_scorer.build_hmm(
-                list(pred_visemes), {}, obs.shape[1],
-            )
-            score_a = self.visual_scorer.score(hmm, obs, text)
-            visual_score_a = score_a["score"]
+            pred_viseme_list = list(pred_visemes)
+            
+            # Build HMM (initially untrained)
+            hmm = self.visual_scorer.build_hmm(pred_viseme_list, {}, obs.shape[1])
+            
+            # Apply trained emission parameters if available
+            if self.trained_emissions:
+                hmm = self._apply_trained_emissions_to_hmm(hmm, pred_viseme_list)
+            
+            score_a = self.visual_scorer.score(hmm, obs, pred_viseme_list)
+            result["visual_score_a"] = score_a["score"]
+            result["visual_details_a"] = score_a
 
-        if visual_score_b is not None:
-            visual_score = visual_score_b
-        if visual_score_a is not None:
-            visual_score = visual_score_a
+        # Choose primary visual score (prefer Mode B)
+        if result["visual_score_b"] is not None:
+            result["visual_score"] = result["visual_score_b"]
+        elif result["visual_score_a"] is not None:
+            result["visual_score"] = result["visual_score_a"]
 
-        return visual_score_a, visual_score_b, visual_score
+        return result
+
+    def _apply_trained_emissions_to_hmm(self, hmm: 'GaussianHMM', viseme_sequence: list[int]) -> 'GaussianHMM':
+        """Apply trained emission parameters to HMM states.
+        
+        Args:
+            hmm: HMM to modify (created with build_hmm).
+            viseme_sequence: Sequence of viseme IDs corresponding to HMM states.
+            
+        Returns:
+            Modified HMM with trained parameters.
+        """
+        if not self.trained_emissions:
+            return hmm
+            
+        for state_idx, viseme_id in enumerate(viseme_sequence):
+            if viseme_id in self.trained_emissions:
+                params = self.trained_emissions[viseme_id]
+                hmm.set_emission_params(state_idx, params['mean'], params['variance'])
+                
+        return hmm
 
     def practice_word(self, word: str) -> dict:
         """Run a single word practice iteration.
@@ -150,9 +282,10 @@ class Session:
             audio_score = overall_gop_score(phoneme_scores)
 
             # Visual scoring
-            visual_score_a, visual_score_b, visual_score = (
-                self._compute_visual_score(video_frames, word)
-            )
+            visual_results = self._compute_visual_score(video_frames, word)
+            visual_score_a = visual_results["visual_score_a"]
+            visual_score_b = visual_results["visual_score_b"]
+            visual_score = visual_results["visual_score"]
 
             # Combined scoring
             combined = combine_scores(audio_score, visual_score)
@@ -166,6 +299,9 @@ class Session:
                 "audio_score": audio_score,
                 "visual_score_a": visual_score_a,
                 "visual_score_b": visual_score_b,
+                "visual_score": visual_score,
+                "visual_details_a": visual_results["visual_details_a"],
+                "visual_details_b": visual_results["visual_details_b"],
                 "combined_score": combined,
                 "phoneme_details": per_phoneme,
                 "feedback": fb,
@@ -204,9 +340,10 @@ class Session:
             audio_score = overall_gop_score(phoneme_scores)
 
             # Visual scoring
-            visual_score_a, visual_score_b, visual_score = (
-                self._compute_visual_score(video_frames, sentence)
-            )
+            visual_results = self._compute_visual_score(video_frames, sentence)
+            visual_score_a = visual_results["visual_score_a"]
+            visual_score_b = visual_results["visual_score_b"]
+            visual_score = visual_results["visual_score"]
 
             # Combined per-phoneme scoring
             combined = combine_scores(audio_score, visual_score)
@@ -247,6 +384,9 @@ class Session:
                 "audio_score": audio_score,
                 "visual_score_a": visual_score_a,
                 "visual_score_b": visual_score_b,
+                "visual_score": visual_score,
+                "visual_details_a": visual_results["visual_details_a"],
+                "visual_details_b": visual_results["visual_details_b"],
                 "combined_score": combined,
                 "word_scores": word_fb,
                 "word_segments": word_segments,

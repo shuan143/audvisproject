@@ -1,16 +1,18 @@
-"""Left-to-right HMM with Gaussian emissions and Forward Algorithm."""
+"""Left-to-right HMM with diagonal Gaussian emissions and Forward Algorithm."""
 
 import numpy as np
-from scipy.stats import multivariate_normal
 
 from pronun.config import HMM_COV_REGULARIZATION
 
 
 class GaussianHMM:
-    """Left-to-right HMM with Gaussian emission probabilities.
+    """Left-to-right HMM with diagonal Gaussian emission probabilities.
 
     States correspond to visemes in a sequence. Transitions only allow
     self-loops or advancing to the next state (left-to-right constraint).
+    
+    Uses diagonal covariance matrices for numerical stability and reduced
+    parameter count (248 variances vs 30,000+ full covariance parameters).
     """
 
     def __init__(self, num_states: int, feature_dim: int, self_loop_prob: float = 0.5):
@@ -32,11 +34,9 @@ class GaussianHMM:
         self.log_pi = np.full(num_states, -np.inf)
         self.log_pi[0] = 0.0
 
-        # Emission parameters (Gaussian): means and covariances per state
+        # Emission parameters (diagonal Gaussian): means and variances per state
         self.means = np.zeros((num_states, feature_dim))
-        self.covs = np.array([
-            np.eye(feature_dim) for _ in range(num_states)
-        ])
+        self.variances = np.ones((num_states, feature_dim))  # Diagonal covariance only
 
     def _build_transition_matrix(self) -> np.ndarray:
         """Build left-to-right log-transition matrix."""
@@ -49,19 +49,19 @@ class GaussianHMM:
                 trans[i][i] = 0.0  # last state must self-loop
         return trans
 
-    def set_emission_params(self, state: int, mean: np.ndarray, cov: np.ndarray):
-        """Set Gaussian emission parameters for a state.
+    def set_emission_params(self, state: int, mean: np.ndarray, variance: np.ndarray):
+        """Set diagonal Gaussian emission parameters for a state.
 
         Args:
             state: State index.
             mean: Mean vector of shape (feature_dim,).
-            cov: Covariance matrix of shape (feature_dim, feature_dim).
+            variance: Variance vector of shape (feature_dim,).
         """
         self.means[state] = mean
-        self.covs[state] = cov + HMM_COV_REGULARIZATION * np.eye(self.feature_dim)
+        self.variances[state] = variance + HMM_COV_REGULARIZATION
 
     def train_emissions(self, state: int, observations: np.ndarray):
-        """Estimate Gaussian parameters from labeled observations for a state.
+        """Estimate diagonal Gaussian parameters from labeled observations for a state.
 
         Args:
             state: State index.
@@ -69,16 +69,18 @@ class GaussianHMM:
         """
         if len(observations) < 2:
             mean = observations[0] if len(observations) == 1 else np.zeros(self.feature_dim)
-            cov = np.eye(self.feature_dim)
+            variance = np.ones(self.feature_dim)
         else:
-            mean = observations.mean(axis=0)
-            cov = np.cov(observations, rowvar=False)
+            mean = observations.mean(axis=0)  # 248D mean vector
+            variance = observations.var(axis=0)  # 248D variance vector (diagonal only)
 
-        self.set_emission_params(state, mean, cov)
+        self.set_emission_params(state, mean, variance)
 
     def log_emission_prob(self, state: int, observation: np.ndarray) -> float:
-        """Compute log P(observation | state) using Gaussian emission.
+        """Compute log P(observation | state) using diagonal Gaussian emission.
 
+        Manual computation: log P(x) = -0.5 * Σ[log(2πσ²) + (x-μ)²/σ²]
+        
         Args:
             state: State index.
             observation: Feature vector of shape (feature_dim,).
@@ -87,10 +89,19 @@ class GaussianHMM:
             Log probability.
         """
         try:
-            return float(multivariate_normal.logpdf(
-                observation, mean=self.means[state], cov=self.covs[state],
-            ))
-        except (np.linalg.LinAlgError, ValueError):
+            mean = self.means[state]
+            var = self.variances[state]
+            
+            # Ensure positive variances for numerical stability
+            var = np.maximum(var, 1e-8)
+            
+            # Diagonal Gaussian log-likelihood: log P(x) = -0.5 * Σ[log(2πσ²) + (x-μ)²/σ²]
+            diff_sq = (observation - mean) ** 2
+            log_likelihood = -0.5 * np.sum(
+                np.log(2 * np.pi * var) + diff_sq / var
+            )
+            return float(log_likelihood)
+        except (ValueError, FloatingPointError):
             return -1e10
 
     def forward(self, observations: np.ndarray) -> float:

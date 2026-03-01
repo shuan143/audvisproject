@@ -20,9 +20,23 @@ python -m pronun.cli compare hello
 
 **Run tests:**
 ```bash
-pytest tests/                        # all tests (79 unit tests, no hardware required)
+pytest tests/                        # all tests (84 unit tests, 79 pass + 5 camera tests auto-skip)
 pytest tests/test_scorer.py          # single test file
 pytest tests/test_gop_scorer.py -v   # verbose single file
+```
+
+**Train visual scoring models** (requires GRID Corpus dataset):
+```bash
+# Quick training with limited data (recommended for development/testing)
+python -m pronun.training.train_hmm_emissions /path/to/grid/corpus --max-videos 100 --max-speakers 3 --output models/hmm_emissions.npz
+python -m pronun.training.calibrate_reference /path/to/grid/corpus --emissions models/hmm_emissions.npz --max-videos 50 --max-speakers 2 --output models/reference_baseline.npz
+
+# Full dataset training (for production)
+python -m pronun.training.train_hmm_emissions /path/to/grid/corpus --output models/hmm_emissions.npz
+python -m pronun.training.calibrate_reference /path/to/grid/corpus --emissions models/hmm_emissions.npz --output models/reference_baseline.npz
+
+# Test trained models
+python -m pronun.training.example_usage
 ```
 
 **Check camera is functional** (requires webcam + macOS camera permission granted to Terminal):
@@ -45,7 +59,7 @@ The system is a pronunciation correction tool combining audio (GOP) and visual (
 3. **Audio recognition**: `recognize()` (`audio/phoneme_recognizer.py`) runs wav2vec2 CTC inference (model: `facebook/wav2vec2-lv-60-espeak-cv-ft`, auto-downloaded from HuggingFace)
 4. **GOP scoring**: `compute_gop()` (`audio/gop_scorer.py`) aligns predicted vs. target phonemes via edit-distance and averages frame-level log-probs; normalizes to 0–100
 5. **Visual scoring** (if camera enabled):
-   - `LandmarkExtractor` → `normalize_sequence` → `build_feature_sequence` produces per-frame vectors (4 geometric features + flattened 3D landmarks + deltas)
+   - `LandmarkExtractor` → `normalize_sequence` → `build_feature_sequence` produces per-frame vectors (4 geometric features + flattened 3D landmarks + deltas + velocity features = 254-dim total)
    - **Mode B** (default): `LeeViseme.text_to_viseme_sequence()` maps text → viseme IDs; `VisualScorer.build_hmm()` + `score()` runs Forward Algorithm on a `GaussianHMM`
    - **Mode A**: `KMeansViseme` clusters frames into viseme IDs instead
 6. **Combine**: `adaptive_combine()` (`scoring/combiner.py`) weights audio vs. visual per phoneme — bilabial phonemes (P, B, M, F, V, W…) get 50/50; visually ambiguous get 90/10
@@ -79,17 +93,19 @@ All numeric constants (model name, recording params, lip landmark indices, GOP n
 
 The visual scoring pipeline is fully implemented but produces 0 because two things have never been built:
 
-1. **HMM emissions are untrained** — `Session._compute_visual_score()` calls `build_hmm(viseme_seq, {}, feature_dim)` with an empty observations dict, so every HMM state defaults to `N(mean=0, cov=I)`. For 248-dim features this gives `L_norm ≈ -300` per frame.
-2. **`ReferenceBaseline` default is wrong** — `default_reference = -5.0` was designed for trained emissions. With untrained HMMs, `exp(L_norm − L_ref) = exp(−295) ≈ 0`, so score always rounds to 0.
+1. **HMM emissions are untrained** — `Session._compute_visual_score()` calls `build_hmm(viseme_seq, {}, feature_dim)` with an empty observations dict, so every HMM state defaults to `N(mean=0, cov=I)`. For 254-dim features this gives `L_norm ≈ -310` per frame.
+2. **`ReferenceBaseline` default is wrong** — `default_reference = -5.0` was designed for trained emissions. With untrained HMMs, `exp(L_norm − L_ref) = exp(−305) ≈ 0`, so score always rounds to 0.
 
-**To fix visual scoring, these must be built in order:**
+**Training Visual Scoring Components:**
 
-| # | Task | Blocks |
-|---|------|--------|
-| 1 | **Build viseme data collection pipeline** — record speakers, extract 248-dim lip feature vectors, label by viseme ID (0–12) | #2, #3, #4 |
-| 2 | **Train HMM emission parameters** — call `hmm.train_emissions(viseme_id, observations)` per viseme, save to disk, load in `Session` | visual score |
-| 3 | **Calibrate `ReferenceBaseline`** — record native speakers, run trained HMM Forward Algorithm, call `ReferenceBaseline.update_from_samples()`, save/load via `ReferenceBaseline.save()` | visual score |
-| 4 | **Train `KMeansViseme` (Mode A)** — call `KMeansViseme(k=12).train(all_features)`, save model, load in `Session.__init__` | Mode A |
+| # | Task | Status | Notes |
+|---|------|---------|-------|
+| 1 | **Build viseme data collection pipeline** — record speakers, extract 254-dim lip feature vectors, label by viseme ID (0–12) | ✅ Complete | `grid_corpus.py` + `GridCorpusFeatureExtractor` |
+| 2 | **Train HMM emission parameters** — call `hmm.train_emissions(viseme_id, observations)` per viseme, save to disk, load in `Session` | ✅ Complete | `train_hmm_emissions.py` |
+| 3 | **Calibrate `ReferenceBaseline`** — record native speakers, run trained HMM Forward Algorithm, compute universal (μ_ref, σ_ref) | ✅ Complete | `calibrate_reference.py` |
+| 4 | **Train `KMeansViseme` (Mode A)** — call `KMeansViseme(k=12).train(all_features)`, save model, load in `Session.__init__` | ⏳ Pending | Mode A implementation |
+
+**Visual scoring is now functional with trained models!** Tasks #2-3 enable non-zero visual scores.
 
 ### Other bugs and improvements
 

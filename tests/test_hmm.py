@@ -14,8 +14,8 @@ def test_forward_known_hmm():
     hmm = GaussianHMM(num_states=2, feature_dim=1, self_loop_prob=0.5)
 
     # State 0: mean=0, var=1; State 1: mean=5, var=1
-    hmm.set_emission_params(0, np.array([0.0]), np.array([[1.0]]))
-    hmm.set_emission_params(1, np.array([5.0]), np.array([[1.0]]))
+    hmm.set_emission_params(0, np.array([0.0]), np.array([1.0]))
+    hmm.set_emission_params(1, np.array([5.0]), np.array([1.0]))
 
     # Observation near state 0, then near state 1
     obs = np.array([[0.1], [4.9]])
@@ -34,7 +34,7 @@ def test_forward_known_hmm():
 
 def test_single_observation():
     hmm = GaussianHMM(num_states=1, feature_dim=2, self_loop_prob=1.0)
-    hmm.set_emission_params(0, np.array([0.0, 0.0]), np.eye(2))
+    hmm.set_emission_params(0, np.array([0.0, 0.0]), np.array([1.0, 1.0]))
 
     obs = np.array([[0.0, 0.0]])
     ll = hmm.forward(obs)
@@ -50,9 +50,9 @@ def test_empty_observations():
 def test_left_to_right_constraint():
     """Observations matching reverse order should score lower."""
     hmm = GaussianHMM(num_states=3, feature_dim=1, self_loop_prob=0.3)
-    hmm.set_emission_params(0, np.array([0.0]), np.array([[0.1]]))
-    hmm.set_emission_params(1, np.array([5.0]), np.array([[0.1]]))
-    hmm.set_emission_params(2, np.array([10.0]), np.array([[0.1]]))
+    hmm.set_emission_params(0, np.array([0.0]), np.array([0.1]))
+    hmm.set_emission_params(1, np.array([5.0]), np.array([0.1]))
+    hmm.set_emission_params(2, np.array([10.0]), np.array([0.1]))
 
     # Correct order
     correct = np.array([[0.0], [5.0], [10.0]])
@@ -83,8 +83,8 @@ def test_train_emissions():
 def test_self_loop_prob():
     """More frames per state should be handled by self-loop."""
     hmm = GaussianHMM(num_states=2, feature_dim=1, self_loop_prob=0.7)
-    hmm.set_emission_params(0, np.array([0.0]), np.array([[1.0]]))
-    hmm.set_emission_params(1, np.array([5.0]), np.array([[1.0]]))
+    hmm.set_emission_params(0, np.array([0.0]), np.array([1.0]))
+    hmm.set_emission_params(1, np.array([5.0]), np.array([1.0]))
 
     # Many frames near state 0, then state 1
     obs = np.vstack([np.zeros((10, 1)), np.full((10, 1), 5.0)])

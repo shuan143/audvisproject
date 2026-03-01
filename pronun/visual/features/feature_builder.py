@@ -71,24 +71,27 @@ def build_feature(normalized: np.ndarray) -> np.ndarray:
 def build_feature_sequence(
     normalized_seq: list[np.ndarray | None],
 ) -> list[np.ndarray]:
-    """Build feature vectors with delta features for a frame sequence.
+    """Build feature vectors with enhanced temporal features for a frame sequence.
 
-    For each frame t:
-        f_t = build_feature(normalized_t)
-        Δf_t = f_t - f_{t-1}  (zero for first frame)
-        output_t = concatenate(f_t, Δf_t)
+    For each frame t, computes:
+        f_t = build_feature(normalized_t) - static features
+        Δf_t = f_t - f_{t-1} - first-order temporal derivatives  
+        v_t = lip_movement_velocity(normalized_t, normalized_{t-1}) - velocity features
+        output_t = concatenate(f_t, Δf_t, v_t)
 
     Frames where landmarks are None are skipped.
 
     Returns:
-        List of feature vectors (with deltas appended).
+        List of enhanced feature vectors with velocity and temporal derivatives.
     """
     static_features = []
+    normalized_valid = []
     valid_indices = []
 
     for i, norm in enumerate(normalized_seq):
         if norm is not None:
             static_features.append(build_feature(norm))
+            normalized_valid.append(norm)
             valid_indices.append(i)
 
     if not static_features:
@@ -96,19 +99,58 @@ def build_feature_sequence(
 
     result = []
     for i, feat in enumerate(static_features):
+        # First-order temporal derivatives (deltas)
         if i == 0:
             delta = np.zeros_like(feat)
         else:
             delta = feat - static_features[i - 1]
-        result.append(np.concatenate([feat, delta]))
+        
+        # Lip movement velocity features
+        if i == 0:
+            velocity = np.zeros(6)  # [vx, vy, vz for upper/lower lip midpoints]
+        else:
+            velocity = _compute_lip_velocity(normalized_valid[i], normalized_valid[i-1])
+        
+        # Enhanced feature vector: static + deltas + velocity
+        enhanced_feat = np.concatenate([feat, delta, velocity])
+        result.append(enhanced_feat)
 
     return result
+
+
+def _compute_lip_velocity(current_landmarks: np.ndarray, 
+                         previous_landmarks: np.ndarray) -> np.ndarray:
+    """Compute lip movement velocity between consecutive frames.
+    
+    Args:
+        current_landmarks: Current frame normalized landmarks (N, 3).
+        previous_landmarks: Previous frame normalized landmarks (N, 3).
+        
+    Returns:
+        6-dimensional velocity vector [upper_vx, upper_vy, upper_vz, 
+                                      lower_vx, lower_vy, lower_vz].
+    """
+    # Velocity of key lip points (upper and lower midpoints)
+    upper_curr = current_landmarks[_UPPER_IDX]
+    upper_prev = previous_landmarks[_UPPER_IDX]
+    upper_velocity = upper_curr - upper_prev
+    
+    lower_curr = current_landmarks[_LOWER_IDX]
+    lower_prev = previous_landmarks[_LOWER_IDX]
+    lower_velocity = lower_curr - lower_prev
+    
+    return np.concatenate([upper_velocity, lower_velocity])
 
 
 def feature_dim(num_landmarks: int) -> int:
     """Compute expected feature dimension.
 
-    4 geometric + 3*N landmark coords, all doubled for deltas.
+    Static: 4 geometric + 3*N landmark coords
+    Deltas: Same dimensions as static features  
+    Velocity: 6 dimensional lip velocity features
+    Total: static + deltas + velocity
     """
     static = 4 + 3 * num_landmarks
-    return static * 2
+    deltas = static
+    velocity = 6
+    return static + deltas + velocity

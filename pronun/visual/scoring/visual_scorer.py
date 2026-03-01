@@ -1,64 +1,84 @@
-"""Visual pronunciation scorer using HMM log-likelihood."""
+"""Visual pronunciation scorer using research-based statistical scoring."""
 
 import numpy as np
 
 from pronun.visual.scoring.hmm import GaussianHMM
-from pronun.visual.scoring.reference import ReferenceBaseline
+from pronun.visual.scoring.reference import ReferenceBaseline, UniversalReferenceBaseline
 
 
 class VisualScorer:
-    """Converts HMM log-likelihood into a 0-100 pronunciation score.
+    """Converts HMM log-likelihood into a 0-100 pronunciation score using research formula.
 
-    Score pipeline:
-        1. L = log P(V | HMM) via Forward Algorithm
+    Research-based scoring pipeline:
+        1. L = log P(O | HMM) via Forward Algorithm  
         2. L_norm = L / T (time normalization)
-        3. Score_raw = exp(L_norm - L_ref)
-        4. Score = 100 * min(1, Score_raw)
+        3. Score = clamp(80 + 10 × (L_norm - μ_ref) / σ_ref, 0, 100)
+    
+    Uses universal reference baseline (μ_ref, σ_ref) for speaker-independent scoring.
     """
 
-    def __init__(self, reference: ReferenceBaseline | None = None):
+    def __init__(self, reference: ReferenceBaseline | UniversalReferenceBaseline | None = None):
         self.reference = reference or ReferenceBaseline()
 
     def score(
         self,
         hmm: GaussianHMM,
         observations: np.ndarray,
-        word: str = "",
+        viseme_sequence: list[int] = None,
     ) -> dict:
-        """Score an observation sequence against an HMM.
+        """Score an observation sequence against an HMM using research formula.
 
         Args:
             hmm: Trained HMM for the target viseme sequence.
             observations: Feature vectors, shape (T, feature_dim).
-            word: Word being scored (for reference lookup).
+            viseme_sequence: Viseme sequence for output (optional).
 
         Returns:
-            Dict with 'log_likelihood', 'log_likelihood_norm',
-            'reference', 'score_raw', 'score'.
+            Dict with 'log_likelihood', 'log_likelihood_norm', 'viseme_sequence',
+            'mu_ref', 'sigma_ref', 'score_raw', 'score', 'confidence'.
         """
         T = len(observations)
         if T == 0:
+            stats = self.reference.get_universal_statistics()
             return {
                 "log_likelihood": -np.inf,
                 "log_likelihood_norm": -np.inf,
-                "reference": self.reference.get_reference(word),
+                "viseme_sequence": viseme_sequence or [],
+                "mu_ref": stats["mu"],
+                "sigma_ref": stats["sigma"],
                 "score_raw": 0.0,
                 "score": 0.0,
+                "confidence": 0.0,
             }
 
+        # Forward Algorithm: L = log P(O | λ)
         log_likelihood = hmm.forward(observations)
+        
+        # Time normalization: L_norm = L / T
         log_likelihood_norm = log_likelihood / T
 
-        l_ref = self.reference.get_reference(word)
-        score_raw = float(np.exp(log_likelihood_norm - l_ref))
-        score = 100.0 * min(1.0, score_raw)
+        # Universal reference statistics (speaker-independent)
+        stats = self.reference.get_universal_statistics()
+        mu_ref = stats["mu"]
+        sigma_ref = stats["sigma"]
+
+        # Research scoring formula: Score = clamp(80 + 10 × (L_norm - μ_ref) / σ_ref, 0, 100)
+        score_raw = 80.0 + 10.0 * (log_likelihood_norm - mu_ref) / sigma_ref
+        score = max(0.0, min(100.0, score_raw))  # Clamp to [0, 100]
+        
+        # Confidence based on statistical distance and sequence length
+        z_score = abs((log_likelihood_norm - mu_ref) / sigma_ref)
+        confidence = np.exp(-0.5 * z_score) * min(1.0, T / 20.0)
 
         return {
             "log_likelihood": log_likelihood,
             "log_likelihood_norm": log_likelihood_norm,
-            "reference": l_ref,
+            "viseme_sequence": viseme_sequence or [],
+            "mu_ref": mu_ref,
+            "sigma_ref": sigma_ref,
             "score_raw": score_raw,
             "score": score,
+            "confidence": confidence,
         }
 
     def build_hmm(
