@@ -15,6 +15,19 @@ from pronun.data.sentence_lists import (
     ALL_SENTENCES, BEGINNER_SENTENCES, INTERMEDIATE_SENTENCES,
     ADVANCED_SENTENCES, SENTENCE_FOCUS,
 )
+from pronun.audio.g2p import ARPABET_TO_IPA
+from pronun.data.lee_map import arpabet_to_viseme, LEE_VISEME_LABELS
+
+# Reverse map: IPA symbol → Lee viseme label (e.g. "p" → "P", "æ" → "EY")
+_IPA_TO_VISEME_LABEL: dict[str, str] = {
+    ipa: LEE_VISEME_LABELS.get(arpabet_to_viseme(arp), "SIL")
+    for arp, ipa in ARPABET_TO_IPA.items()
+}
+
+
+def _viseme_label(phoneme: str) -> str:
+    """Return the Lee viseme label for an IPA phoneme string."""
+    return _IPA_TO_VISEME_LABEL.get(phoneme, "?")
 
 
 console = Console()
@@ -35,6 +48,7 @@ def show_score_table(result: dict):
     """Display per-phoneme scoring as a rich table (legacy word mode)."""
     table = Table(title=f"Pronunciation: '{result['word']}'")
     table.add_column("Phoneme", style="cyan")
+    table.add_column("Viseme", style="magenta")
     table.add_column("Audio", justify="right")
     table.add_column("Visual", justify="right")
     table.add_column("Combined", justify="right")
@@ -51,6 +65,7 @@ def show_score_table(result: dict):
 
         table.add_row(
             fb["phoneme"],
+            _viseme_label(fb["phoneme"]),
             audio,
             visual,
             f"{fb['score']:.0f}",
@@ -152,6 +167,7 @@ def show_sentence_result(result: dict):
     phoneme_table = Table(title="Phoneme Details")
     phoneme_table.add_column("Word", style="dim")
     phoneme_table.add_column("Phoneme", style="cyan")
+    phoneme_table.add_column("Viseme", style="magenta")
     phoneme_table.add_column("Score", justify="right")
     phoneme_table.add_column("Level", style="bold")
     phoneme_table.add_column("Tip")
@@ -163,6 +179,7 @@ def show_sentence_result(result: dict):
         phoneme_table.add_row(
             word_label,
             fb["phoneme"],
+            _viseme_label(fb["phoneme"]),
             f"{fb['score']:.1f}",
             f"[{level_color}]{fb['level']}[/{level_color}]",
             fb.get("tip") or "",
@@ -314,7 +331,12 @@ def cmd_practice(args):
     console.print("[dim]Interactive session — press Enter for next, 'r' to retry, 'p' for progress, 'q' to quit[/dim]")
     console.print()
 
-    with Session(use_camera=args.camera, mode=mode) as session:
+    with Session(
+        use_camera=args.camera,
+        mode=mode,
+        hmm_emissions_path=getattr(args, "hmm_emissions", None),
+        reference_baseline_path=getattr(args, "reference_baseline", None),
+    ) as session:
         current_sentence = _pick_sentence(level, index)
 
         while True:
@@ -372,7 +394,12 @@ def cmd_practice_word(args):
     console.print(f"Words: {', '.join(words)}")
     console.print()
 
-    with Session(use_camera=args.camera, mode=mode) as session:
+    with Session(
+        use_camera=args.camera,
+        mode=mode,
+        hmm_emissions_path=getattr(args, "hmm_emissions", None),
+        reference_baseline_path=getattr(args, "reference_baseline", None),
+    ) as session:
         for word in words:
             console.print(f"[bold cyan]Say: '{word}'[/bold cyan]")
             console.print("Recording... (speak now, silence to stop)")
@@ -443,7 +470,12 @@ def cmd_compare(args):
     console.print(f"[bold]Comparing modes for '{word}'[/bold]")
     console.print("Recording... (speak now)")
 
-    with Session(use_camera=True, mode="both") as session:
+    with Session(
+        use_camera=True,
+        mode="both",
+        hmm_emissions_path=getattr(args, "hmm_emissions", None),
+        reference_baseline_path=getattr(args, "reference_baseline", None),
+    ) as session:
         result = session.practice_word(word)
         show_score_table(result)
 
@@ -473,6 +505,10 @@ def main():
                             help="Visual scoring mode")
     p_practice.add_argument("--no-camera", dest="camera", action="store_false",
                             help="Disable webcam (audio only)")
+    p_practice.add_argument("--hmm-emissions", dest="hmm_emissions", default=None,
+                            help="Path to trained HMM emissions file (.npz)")
+    p_practice.add_argument("--reference-baseline", dest="reference_baseline", default=None,
+                            help="Path to calibrated reference baseline file (.npz)")
     p_practice.set_defaults(func=cmd_practice)
 
     # Practice-word command (legacy word mode)
@@ -482,6 +518,10 @@ def main():
                         help="Visual scoring mode")
     p_word.add_argument("--no-camera", dest="camera", action="store_false",
                         help="Disable webcam (audio only)")
+    p_word.add_argument("--hmm-emissions", dest="hmm_emissions", default=None,
+                        help="Path to trained HMM emissions file (.npz)")
+    p_word.add_argument("--reference-baseline", dest="reference_baseline", default=None,
+                        help="Path to calibrated reference baseline file (.npz)")
     p_word.set_defaults(func=cmd_practice_word)
 
     # List command (sentences)
@@ -503,6 +543,10 @@ def main():
     # Compare command
     p_compare = subparsers.add_parser("compare", help="Compare Mode A vs Mode B")
     p_compare.add_argument("word", help="Word to compare")
+    p_compare.add_argument("--hmm-emissions", dest="hmm_emissions", default=None,
+                           help="Path to trained HMM emissions file (.npz)")
+    p_compare.add_argument("--reference-baseline", dest="reference_baseline", default=None,
+                           help="Path to calibrated reference baseline file (.npz)")
     p_compare.set_defaults(func=cmd_compare)
 
     args = parser.parse_args()

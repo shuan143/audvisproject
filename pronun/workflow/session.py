@@ -3,6 +3,9 @@
 import tempfile
 import os
 import sys
+
+_DEFAULT_EMISSIONS_PATH = "models/hmm_emissions.npz"
+_DEFAULT_BASELINE_PATH = "models/reference_baseline.npz"
 from typing import Optional
 
 import numpy as np
@@ -54,6 +57,12 @@ class Session:
         self.camera = None
         self.tracker = SessionTracker()
         
+        # Auto-detect default model paths if not explicitly provided
+        if hmm_emissions_path is None and os.path.exists(_DEFAULT_EMISSIONS_PATH):
+            hmm_emissions_path = _DEFAULT_EMISSIONS_PATH
+        if reference_baseline_path is None and os.path.exists(_DEFAULT_BASELINE_PATH):
+            reference_baseline_path = _DEFAULT_BASELINE_PATH
+
         # Load trained parameters if provided
         self.trained_emissions = None
         if hmm_emissions_path:

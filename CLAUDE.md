@@ -115,3 +115,13 @@ The visual scoring pipeline is fully implemented but produces 0 because two thin
 | 6 | **Per-phoneme visual scoring** | `adaptive_combine()` applies one sentence-level visual score to all phonemes. Should use GOP frame timestamps to slice video frames per phoneme and score each separately |
 | 7 | **Remove dead code `audio/recorder.py`** | `record_audio()` is never called; `Session` uses `SyncRecorder` instead |
 | 8 | **Fix empty Word column in Phoneme Details table** | `_phoneme_to_word()` in `cli.py` looks up `phoneme_start/phoneme_end` from `word_scores`, but `generate_word_feedback()` strips those keys — use `word_segments` from the result dict instead |
+
+## Pre-push Checklist (GitHub)
+
+Before every `git push`, verify these files are up to date:
+
+1. **`.gitignore`** — `models/` and `*.npz` must NOT be listed (trained models are committed). `grid_dataset/` should remain ignored (large corpus, not committed).
+2. **`CLAUDE.md`** — reflects current architecture, known gaps, and commands.
+3. **`requirements.txt`** — matches all imports actually used in the codebase.
+
+The `models/` directory (containing `hmm_emissions.npz` and `reference_baseline.npz`) is intentionally tracked in git so collaborators can use the trained models without re-running the GRID corpus training pipeline.

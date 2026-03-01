@@ -9,10 +9,11 @@ __pycache__/
 # Downloaded models (auto-downloaded on first run)
 .cache/
 
-# Trained models and datasets
-models/
+# Datasets (large, not committed)
 grid_dataset/
-*.npz
+
+# Serialized ML artefacts — except trained models in models/
+# models/ and *.npz are intentionally NOT ignored (committed to repo)
 *.pkl
 *.joblib
 
